@@ -1774,21 +1774,23 @@ impl<T: Storage> Raft<T> {
                 "{} [commit: {}] restored snapshot [index: {}, term: {}]",
                 self.tag, self.raft_log.committed, sindex, sterm
             );
-            let mut to_send = Message::new();
+            println!("miao?");
+            /*let mut to_send = Message::new();
             to_send.set_to(m.get_from());
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.set_index(self.raft_log.last_index());
-            self.send(to_send);
+            self.send(to_send);*/
         } else {
             info!(
                 "{} [commit: {}] ignored snapshot [index: {}, term: {}]",
                 self.tag, self.raft_log.committed, sindex, sterm
             );
-            let mut to_send = Message::new();
+            println!("miao???");
+            /*let mut to_send = Message::new();
             to_send.set_to(m.get_from());
             to_send.set_msg_type(MessageType::MsgAppendResponse);
             to_send.set_index(self.raft_log.committed);
-            self.send(to_send);
+            self.send(to_send);*/
         }
     }
 
