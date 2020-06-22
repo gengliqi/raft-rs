@@ -931,10 +931,12 @@ impl<T: Storage> Raft<T> {
         // If a network partition happens, and leader is in minority partition,
         // it will step down, and become follower without notifying others.
         self.leader_id = INVALID_ID;
+        self.set_priority(rand::thread_rng().gen());
         info!(
             self.logger,
-            "became pre-candidate at term {term}",
-            term = self.term;
+            "became pre-candidate at term {term} priority {priority}",
+            term = self.term,
+            priority = self.priority,
         );
     }
 
