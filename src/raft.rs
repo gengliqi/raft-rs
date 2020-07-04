@@ -189,6 +189,9 @@ pub struct Raft<T: Storage> {
 
     /// The election priority of this node.
     pub priority: u64,
+
+    /// Whether the leader comes from transferring leader
+    pub is_transfer_leader: bool,
 }
 
 trait AssertSend: Send {}
@@ -260,6 +263,7 @@ impl<T: Storage> Raft<T> {
             batch_append: c.batch_append,
             logger,
             priority: c.priority,
+            is_transfer_leader: false,
         };
         for p in voters {
             let pr = Progress::new(1, r.max_inflight);
@@ -976,6 +980,7 @@ impl<T: Storage> Raft<T> {
             self.logger,
             "became leader at term {term}",
             term = self.term;
+            "is_transfer_leader" => self.is_transfer_leader,
         );
         trace!(self.logger, "EXIT become_leader");
     }
@@ -990,6 +995,7 @@ impl<T: Storage> Raft<T> {
     ///
     /// If prevote is enabled, this is handled as well.
     pub fn campaign(&mut self, campaign_type: &[u8]) {
+        self.is_transfer_leader = campaign_type == CAMPAIGN_TRANSFER;
         let (vote_msg, term) = if campaign_type == CAMPAIGN_PRE_ELECTION {
             self.become_pre_candidate();
             // Pre-vote RPCs are sent for next term before we've incremented self.term.
