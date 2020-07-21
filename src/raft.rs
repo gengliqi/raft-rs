@@ -904,8 +904,9 @@ impl<T: Storage> Raft<T> {
             StateRole::Leader,
             "invalid transition [leader -> candidate]"
         );
-        let term = self.term + 1;
+        let term = self.term + rand::thread_rng().gen_range(1, 11);
         self.reset(term);
+        self.randomized_election_timeout = rand::thread_rng().gen_range(2, 6);
         let id = self.id;
         self.vote = id;
         self.state = StateRole::Candidate;
@@ -935,6 +936,7 @@ impl<T: Storage> Raft<T> {
         // If a network partition happens, and leader is in minority partition,
         // it will step down, and become follower without notifying others.
         self.leader_id = INVALID_ID;
+        self.randomized_election_timeout = rand::thread_rng().gen_range(2, 6);
         info!(
             self.logger,
             "became pre-candidate at term {term}",
