@@ -96,6 +96,9 @@ pub struct RawNodeAsync<T: Storage> {
     prev_hs: HardState,
     records: VecDeque<ReadyAsyncRecord>,
     max_number: u64,
+    // (index, term) of synced last log
+    synced_last_log: (u64, u64),
+    // Messages that need to be sent to other peers
     messages: Vec<Vec<Message>>,
 }
 
@@ -123,8 +126,10 @@ impl<T: Storage> RawNodeAsync<T> {
             prev_ss: Default::default(),
             records: VecDeque::new(),
             max_number: 0,
+            synced_last_log: (0, 0),
             messages: Vec::new(),
         };
+        rn.synced_last_log = (rn.raft.raft_log.last_index(), rn.raft.raft_log.last_term());
         rn.prev_hs = rn.raft.hard_state();
         rn.prev_ss = rn.raft.soft_state();
         info!(
@@ -144,8 +149,8 @@ impl<T: Storage> RawNodeAsync<T> {
         Self::new(c, store, &crate::default_logger())
     }
 
-    /// Given an range, creates a new Ready value from that range.
-    pub fn ready_from_range(&mut self, applied_idx: u64, synced_idx: u64) -> ReadyAsync {
+    /// Given an index, creates a new Ready value from that index.
+    pub fn ready_since(&mut self, applied_idx: u64) -> ReadyAsync {
         let raft = &mut self.core.raft;
         self.max_number += 1;
         let number = self.max_number;
@@ -177,12 +182,12 @@ impl<T: Storage> RawNodeAsync<T> {
         }
         rd.committed_entries = raft
             .raft_log
-            .next_entries_since(applied_idx, Some(synced_idx));
+            .next_entries_since(applied_idx, Some(self.synced_last_log.0));
         let ss = raft.soft_state();
         if ss != self.prev_ss {
             rd.ss = Some(ss);
         }
-        let hs = raft.hard_state();
+        let hs = raft.hard_state_for_ready();
         if hs != self.prev_hs {
             rd.hs = Some(hs);
         }
@@ -237,28 +242,35 @@ impl<T: Storage> RawNodeAsync<T> {
     }
 
     /// Sync the ready
-    pub fn sync_ready(&mut self, number: u64) {
+    pub fn synced_ready(&mut self, number: u64) {
         loop {
-            if let Some(record) = self.records.front() {
+            let record = if let Some(record) = self.records.pop_front() {
                 if record.number > number {
                     break;
                 }
+                record
             } else {
                 break;
+            };
+            if let Some(last_log) = record.last_log {
+                self.raft.on_sync_entries(last_log.0, last_log.1);
+                self.synced_last_log = last_log;
             }
-            let record = self.records.pop_front();
-            
+            self.raft
+                .raft_log
+                .stable_snap_to(record.snapshot.get_metadata().index);
+            self.messages.push(record.messages);
         }
     }
 
     /// Sync the last ready and get the SyncLastResult
-    pub fn sync_last_ready(&mut self, applied_idx: u64, synced_idx: u64) -> SyncLastResult {
-        self.sync_ready(self.max_number);
+    pub fn synced_last_ready(&mut self, applied_idx: u64) -> SyncLastResult {
+        self.synced_ready(self.max_number);
         let raft = &mut self.core.raft;
         let mut res = SyncLastResult {
             committed_entries: raft
                 .raft_log
-                .next_entries_since(applied_idx, Some(synced_idx)),
+                .next_entries_since(applied_idx, Some(self.synced_last_log.0)),
             messages: vec![],
         };
         mem::swap(&mut res.messages, &mut self.messages);

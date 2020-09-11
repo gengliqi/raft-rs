@@ -843,10 +843,7 @@ impl<T: Storage> Raft<T> {
         }
         self.raft_log.append(es);
 
-        // If singleton, move on self's pr.matched
-        // TODO
-
-        // Otherwise just wait for this entry being stable
+        // Not move on self's pr.matched until self.on_sync_entries
     }
 
     /// Notify that raft_log was well persisted

@@ -320,7 +320,7 @@ impl Ready {
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
-        let hs = raft.hard_state();
+        let hs = raft.hard_state_for_ready();
         if &hs != prev_hs {
             if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
                 rd.must_sync = true;
@@ -477,19 +477,6 @@ impl<T: Storage> RawNode<T> {
         Ready::new(&mut self.core.raft, &self.prev_ss, &self.prev_hs, None)
     }
 
-    /// Return if fetch ready, it will need to be synced immediately
-    pub fn has_must_immediate_sync_ready(&mut self) -> bool {
-        let raft = &self.raft;
-        let hs = raft.hard_state();
-        let prev_hs = &self.prev_hs;
-        if &hs != prev_hs {
-            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
-                return true;
-            }
-        }
-        false
-    }
-
     fn check_has_ready(&self, applied_idx: Option<(u64, Option<u64>)>) -> bool {
         let raft = &self.raft;
         if !raft.msgs.is_empty() || raft.raft_log.unstable_entries().is_some() {
@@ -513,7 +500,7 @@ impl<T: Storage> RawNode<T> {
         if raft.soft_state() != self.prev_ss {
             return true;
         }
-        let hs = raft.hard_state();
+        let hs = raft.hard_state_for_ready();
         if hs != HardState::default() && hs != self.prev_hs {
             return true;
         }
