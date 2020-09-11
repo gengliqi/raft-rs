@@ -20,7 +20,10 @@
 //! nodes but not the raft consensus itself. Generally, you'll interact with the
 //! RawNode first and use it to access the inner workings of the consensus protocol.
 
-use std::{mem, ops::Deref, ops::DerefMut};
+use std::{
+    mem,
+    ops::{Deref, DerefMut},
+};
 
 use protobuf::Message as PbMessage;
 
@@ -100,10 +103,6 @@ impl<T: Storage> RawNodeRaft<T> {
     #[inline]
     pub fn set_priority(&mut self, priority: u64) {
         self.raft.set_priority(priority);
-    }
-
-    fn commit_apply(&mut self, applied: u64) {
-        self.raft.commit_apply(applied);
     }
 
     /// Tick advances the internal logical clock by a single tick.
@@ -301,7 +300,7 @@ impl Ready {
         raft: &mut Raft<T>,
         prev_ss: &SoftState,
         prev_hs: &HardState,
-        since_idx: Option<(u64, Option<u64>)>,
+        since_idx: Option<u64>,
     ) -> Ready {
         let mut rd = Ready {
             entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
@@ -313,9 +312,7 @@ impl Ready {
         rd.committed_entries = Some(
             (match since_idx {
                 None => raft.raft_log.next_entries(),
-                Some((since_idx, synced_idx)) => {
-                    raft.raft_log.next_entries_since(since_idx, synced_idx)
-                }
+                Some(since_idx) => raft.raft_log.next_entries_since(since_idx, None),
             })
             .unwrap_or_else(Vec::new),
         );
@@ -323,7 +320,7 @@ impl Ready {
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
-        let hs = raft.hard_state_for_ready();
+        let hs = raft.hard_state();
         if &hs != prev_hs {
             if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
                 rd.must_sync = true;
@@ -461,23 +458,17 @@ impl<T: Storage> RawNode<T> {
         }
     }
 
+    fn commit_apply(&mut self, applied: u64) {
+        self.raft.commit_apply(applied);
+    }
+
     /// Given an index, creates a new Ready value from that index.
     pub fn ready_since(&mut self, applied_idx: u64) -> Ready {
         Ready::new(
             &mut self.core.raft,
             &self.prev_ss,
             &self.prev_hs,
-            Some((applied_idx, None)),
-        )
-    }
-
-    /// Given an range, creates a new Ready value from that index.
-    pub fn ready_from_range(&mut self, applied_idx: u64, synced_idx: u64) -> Ready {
-        Ready::new(
-            &mut self.core.raft,
-            &self.prev_ss,
-            &self.prev_hs,
-            Some((applied_idx, Some(synced_idx))),
+            Some(applied_idx),
         )
     }
 
@@ -489,7 +480,7 @@ impl<T: Storage> RawNode<T> {
     /// Return if fetch ready, it will need to be synced immediately
     pub fn has_must_immediate_sync_ready(&mut self) -> bool {
         let raft = &self.raft;
-        let hs = raft.hard_state_for_ready();
+        let hs = raft.hard_state();
         let prev_hs = &self.prev_hs;
         if &hs != prev_hs {
             if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
@@ -522,7 +513,7 @@ impl<T: Storage> RawNode<T> {
         if raft.soft_state() != self.prev_ss {
             return true;
         }
-        let hs = raft.hard_state_for_ready();
+        let hs = raft.hard_state();
         if hs != HardState::default() && hs != self.prev_hs {
             return true;
         }

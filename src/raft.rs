@@ -843,7 +843,10 @@ impl<T: Storage> Raft<T> {
         }
         self.raft_log.append(es);
 
-        // Not move on self's pr.matched until self.on_synced
+        // If singleton, move on self's pr.matched
+        // TODO
+
+        // Otherwise just wait for this entry being stable
     }
 
     /// Notify that raft_log was well persisted
@@ -855,12 +858,10 @@ impl<T: Storage> Raft<T> {
                 .map_or(false, |t| t == synced_term)
         {
             let self_id = self.id;
-            let pr = self.mut_prs().get_mut(self_id);
-            if !pr.is_none() {
-                pr.unwrap().maybe_update(synced_index);
-                // Regardless of maybe_commit's return, our caller will call bcastAppend.
-                self.maybe_commit();
-            }
+            let pr = self.mut_prs().get_mut(self_id).unwrap();
+            pr.maybe_update(synced_index);
+            // Regardless of maybe_commit's return, our caller will call bcastAppend.
+            self.maybe_commit();
         }
     }
 
