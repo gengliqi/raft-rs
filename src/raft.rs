@@ -360,6 +360,31 @@ impl<T: Storage> Raft<T> {
         hs
     }
 
+    /// Returns a value representing the hardstate for ready at the time of calling.
+    pub fn hard_state_for_ready(&self) -> HardState {
+        let mut hs = HardState::default();
+        hs.term = self.term;
+        hs.vote = self.vote;
+        hs.commit = self.commit_index_after_sync_log();
+        hs
+    }
+
+    /// Returns the expected commit index after sync all log
+    pub fn commit_index_after_sync_log(&self) -> u64 {
+        if self.state != StateRole::Leader {
+            return self.raft_log.committed;
+        }
+        let replace_matched = Some((self.id, self.raft_log.last_index()));
+        let commit_index = self.prs().maximal_committed_index(replace_matched).0;
+        assert!(commit_index >= self.raft_log.committed);
+        // Since commit_index must be greater than committed, its log must exist so using unwrap here
+        if self.raft_log.term(commit_index).unwrap() == self.term {
+            commit_index
+        } else {
+            self.raft_log.committed
+        }
+    }
+
     /// Returns whether the current raft is in lease.
     pub fn in_lease(&self) -> bool {
         self.state == StateRole::Leader && self.check_quorum
@@ -464,7 +489,7 @@ impl<T: Storage> Raft<T> {
         if !self.apply_to_current_term() {
             return None;
         }
-        let (index, use_group_commit) = self.mut_prs().maximal_committed_index();
+        let (index, use_group_commit) = self.prs().maximal_committed_index(None);
         debug!(
             self.logger,
             "check group commit consistent";
@@ -753,7 +778,7 @@ impl<T: Storage> Raft<T> {
     /// Attempts to advance the commit index. Returns true if the commit index
     /// changed (in which case the caller should call `r.bcast_append`).
     pub fn maybe_commit(&mut self) -> bool {
-        let mci = self.mut_prs().maximal_committed_index().0;
+        let mci = self.prs().maximal_committed_index(None).0;
         if self.raft_log.maybe_commit(mci, self.term) {
             let (self_id, committed) = (self.id, self.raft_log.committed);
             self.mut_prs()
@@ -818,17 +843,24 @@ impl<T: Storage> Raft<T> {
         }
         self.raft_log.append(es);
 
-        // Not move self's pr.matched until self.on_synced
+        // Not move on self's pr.matched until self.on_synced
     }
 
     /// Notify that raft_log was well persisted
-    pub fn on_synced(&mut self, synced_index: u64) {
-        let self_id = self.id;
-        let pr = self.mut_prs().get_mut(self_id);
-        if !pr.is_none() {
-            pr.unwrap().maybe_update(synced_index);
-            // Regardless of maybe_commit's return, our caller will call bcastAppend.
-            self.maybe_commit();
+    pub fn on_sync_entries(&mut self, synced_index: u64, synced_term: u64) {
+        if self.state == StateRole::Leader
+            && self
+                .raft_log
+                .term(synced_index)
+                .map_or(false, |t| t == synced_term)
+        {
+            let self_id = self.id;
+            let pr = self.mut_prs().get_mut(self_id);
+            if !pr.is_none() {
+                pr.unwrap().maybe_update(synced_index);
+                // Regardless of maybe_commit's return, our caller will call bcastAppend.
+                self.maybe_commit();
+            }
         }
     }
 

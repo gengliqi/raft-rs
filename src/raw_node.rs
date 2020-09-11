@@ -20,7 +20,7 @@
 //! nodes but not the raft consensus itself. Generally, you'll interact with the
 //! RawNode first and use it to access the inner workings of the consensus protocol.
 
-use std::mem;
+use std::{mem, ops::Deref, ops::DerefMut};
 
 use protobuf::Message as PbMessage;
 
@@ -31,7 +31,7 @@ use crate::eraftpb::{
 };
 use crate::errors::{Error, Result};
 use crate::read_only::ReadState;
-use crate::{Raft, SoftState, Status, Storage, INVALID_ID};
+use crate::{Raft, SoftState, StateRole, Status, Storage, INVALID_ID};
 use slog::Logger;
 
 /// Represents a Peer node in the cluster.
@@ -81,189 +81,25 @@ pub fn is_empty_snap(s: &Snapshot) -> bool {
     s.is_empty()
 }
 
-/// Ready encapsulates the entries and messages that are ready to read,
-/// be saved to stable storage, committed or sent to other peers.
-/// All fields in Ready are read-only.
-#[derive(Default, Debug, PartialEq)]
-pub struct Ready {
-    ss: Option<SoftState>,
-
-    hs: Option<HardState>,
-
-    read_states: Vec<ReadState>,
-
-    entries: Vec<Entry>,
-
-    snapshot: Snapshot,
-
-    /// CommittedEntries specifies entries to be committed to a
-    /// store/state-machine. These have previously been committed to stable
-    /// store.
-    pub committed_entries: Option<Vec<Entry>>,
-
-    /// Messages specifies outbound messages to be sent AFTER Entries are
-    /// committed to stable storage.
-    /// If it contains a MsgSnap message, the application MUST report back to raft
-    /// when the snapshot has been received or has failed by calling ReportSnapshot.
-    pub messages: Vec<Message>,
-
-    must_sync: bool,
-}
-
-impl Ready {
-    fn new<T: Storage>(
-        raft: &mut Raft<T>,
-        prev_ss: &SoftState,
-        prev_hs: &HardState,
-        since_idx: Option<(u64, Option<u64>)>,
-    ) -> Ready {
-        let mut rd = Ready {
-            entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
-            ..Default::default()
-        };
-        if !raft.msgs.is_empty() {
-            mem::swap(&mut raft.msgs, &mut rd.messages);
-        }
-        rd.committed_entries = Some(
-            (match since_idx {
-                None => raft.raft_log.next_entries(),
-                Some((since_idx, synced_idx)) => raft.raft_log.next_entries_since(since_idx, synced_idx),
-            })
-            .unwrap_or_else(Vec::new),
-        );
-        let ss = raft.soft_state();
-        if &ss != prev_ss {
-            rd.ss = Some(ss);
-        }
-        let hs = raft.hard_state();
-        if &hs != prev_hs {
-            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
-                rd.must_sync = true;
-            }
-            rd.hs = Some(hs);
-        }
-        if raft.raft_log.unstable.snapshot.is_some() {
-            rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
-        }
-        if !raft.read_states.is_empty() {
-            rd.read_states = raft.read_states.clone();
-        }
-        rd
-    }
-
-    /// The current volatile state of a Node.
-    /// SoftState will be nil if there is no update.
-    /// It is not required to consume or store SoftState.
-    #[inline]
-    pub fn ss(&self) -> Option<&SoftState> {
-        self.ss.as_ref()
-    }
-
-    /// The current state of a Node to be saved to stable storage BEFORE
-    /// Messages are sent.
-    /// HardState will be equal to empty state if there is no update.
-    #[inline]
-    pub fn hs(&self) -> Option<&HardState> {
-        self.hs.as_ref()
-    }
-
-    /// States can be used for node to serve linearizable read requests locally
-    /// when its applied index is greater than the index in ReadState.
-    /// Note that the read_state will be returned when raft receives MsgReadIndex.
-    /// The returned is only valid for the request that requested to read.
-    #[inline]
-    pub fn read_states(&self) -> &[ReadState] {
-        &self.read_states
-    }
-
-    /// Entries specifies entries to be saved to stable storage BEFORE
-    /// Messages are sent.
-    #[inline]
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
-    /// Snapshot specifies the snapshot to be saved to stable storage.
-    #[inline]
-    pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
-    }
-
-    /// MustSync indicates whether the HardState and Entries must be synchronously
-    /// written to disk or if an asynchronous write is permissible.
-    #[inline]
-    pub fn must_sync(&self) -> bool {
-        self.must_sync
-    }
-}
-
-/// RawNode is a thread-unsafe Node.
-/// The methods of this struct correspond to the methods of Node and are described
-/// more fully there.
-pub struct RawNode<T: Storage> {
+/// RawNodeRaft encapsulates the Raft structure and some functions related to Raft
+pub struct RawNodeRaft<T: Storage> {
     /// The internal raft state.
     pub raft: Raft<T>,
-    prev_ss: SoftState,
-    prev_hs: HardState,
 }
 
-impl<T: Storage> RawNode<T> {
-    #[allow(clippy::new_ret_no_self)]
-    /// Create a new RawNode given some [`Config`](../struct.Config.html).
+impl<T: Storage> RawNodeRaft<T> {
+    /// Create a new RawNodeRaft given some [`Config`](../struct.Config.html).
     pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
         assert_ne!(config.id, 0, "config.id must not be zero");
         let r = Raft::new(config, store, logger)?;
-        let mut rn = RawNode {
-            raft: r,
-            prev_hs: Default::default(),
-            prev_ss: Default::default(),
-        };
-        rn.prev_hs = rn.raft.hard_state();
-        rn.prev_ss = rn.raft.soft_state();
-        info!(
-            rn.raft.logger,
-            "RawNode created with id {id}.",
-            id = rn.raft.id
-        );
-        Ok(rn)
-    }
-
-    /// Create a new RawNode given some [`Config`](../struct.Config.html) and the default logger.
-    ///
-    /// The default logger is an `slog` to `log` adapter.
-    #[cfg(feature = "default-logger")]
-    #[allow(clippy::new_ret_no_self)]
-    pub fn with_default_logger(c: &Config, store: T) -> Result<Self> {
-        Self::new(c, store, &crate::default_logger())
+        let rn_core = RawNodeRaft { raft: r };
+        Ok(rn_core)
     }
 
     /// Sets priority of node.
     #[inline]
     pub fn set_priority(&mut self, priority: u64) {
         self.raft.set_priority(priority);
-    }
-
-    fn commit_ready(&mut self, rd: Ready) {
-        if rd.ss.is_some() {
-            self.prev_ss = rd.ss.unwrap();
-        }
-        if let Some(e) = rd.hs {
-            if e != HardState::default() {
-                self.prev_hs = e;
-            }
-        }
-        if !rd.entries.is_empty() {
-            let e = rd.entries.last().unwrap();
-            self.raft.raft_log.stable_to(e.index, e.term);
-        }
-        if rd.snapshot != Snapshot::default() {
-            self.raft
-                .raft_log
-                .stable_snap_to(rd.snapshot.get_metadata().index);
-        }
-        if !rd.read_states.is_empty() {
-            self.raft.read_states.clear();
-        }
     }
 
     fn commit_apply(&mut self, applied: u64) {
@@ -348,126 +184,10 @@ impl<T: Storage> RawNode<T> {
         Err(Error::StepPeerNotFound)
     }
 
-    /// Given an index, creates a new Ready value from that index.
-    pub fn ready_since(&mut self, applied_idx: u64) -> Ready {
-        Ready::new(
-            &mut self.raft,
-            &self.prev_ss,
-            &self.prev_hs,
-            Some((applied_idx, None)),
-        )
-    }
-
-    /// Given an range, creates a new Ready value from that index.
-    pub fn ready_from_range(&mut self, applied_idx: u64, synced_idx: u64) -> Ready {
-        Ready::new(
-            &mut self.raft,
-            &self.prev_ss,
-            &self.prev_hs,
-            Some((applied_idx, Some(synced_idx))),
-        )
-    }
-
-    /// Ready returns the current point-in-time state of this RawNode.
-    pub fn ready(&mut self) -> Ready {
-        Ready::new(&mut self.raft, &self.prev_ss, &self.prev_hs, None)
-    }
-
-    /// Return if fetch ready, it will need to be synced immediately
-    pub fn has_must_immediate_sync_ready(&mut self) -> bool {
-        let raft = &self.raft;
-        let hs = raft.hard_state();
-        let prev_hs =&self.prev_hs;
-        if &hs != prev_hs {
-            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn check_has_ready(&self, applied_idx: Option<(u64, Option<u64>)>) -> bool {
-        let raft = &self.raft;
-        if !raft.msgs.is_empty() || raft.raft_log.unstable_entries().is_some() {
-            return true;
-        }
-        if !raft.read_states.is_empty() {
-            return true;
-        }
-        if self.snap().map_or(false, |s| !s.is_empty()) {
-            return true;
-        }
-        let has_unapplied_entries = match applied_idx {
-            None => raft.raft_log.has_next_entries(),
-            Some((applied_idx, synced_idx)) => raft.raft_log.has_next_entries_since(applied_idx, synced_idx),
-        };
-        if has_unapplied_entries {
-            return true;
-        }
-        if raft.soft_state() != self.prev_ss {
-            return true;
-        }
-        let hs = raft.hard_state();
-        if hs != HardState::default() && hs != self.prev_hs {
-            return true;
-        }
-        false
-    }
-
-    /// Given an index, can determine if there is a ready state from that time.
-    #[inline]
-    pub fn has_ready_since(&self, applied_idx: u64) -> bool {
-        self.check_has_ready(Some((applied_idx, None)))
-    }
-
-    /// Given an index range, can determine if there is a ready state between that time span.
-    #[inline]
-    pub fn has_ready_from_range(&self, applied_idx: u64, synced_idx: u64) -> bool {
-        self.check_has_ready(Some((applied_idx, Some(synced_idx))))
-    }
-
-    /// HasReady called when RawNode user need to check if any Ready pending.
-    /// Checking logic in this method should be consistent with Ready.containsUpdates().
-    #[inline]
-    pub fn has_ready(&self) -> bool {
-        self.check_has_ready(None)
-    }
-
     /// Grabs the snapshot from the raft if available.
     #[inline]
     pub fn snap(&self) -> Option<&Snapshot> {
         self.raft.snap()
-    }
-
-    /// Advance notifies the RawNode that the application has applied and saved progress in the
-    /// last Ready results.
-    pub fn advance(&mut self, rd: Ready) {
-        self.advance_append(rd);
-        let commit_idx = self.prev_hs.commit;
-        if commit_idx != 0 {
-            // In most cases, prevHardSt and rd.HardState will be the same
-            // because when there are new entries to apply we just sent a
-            // HardState with an updated Commit value. However, on initial
-            // startup the two are different because we don't send a HardState
-            // until something changes, but we do send any un-applied but
-            // committed entries (and previously-committed entries may be
-            // incorporated into the snapshot, even if rd.CommittedEntries is
-            // empty). Therefore we mark all committed entries as applied
-            // whether they were included in rd.HardState or not.
-            self.advance_apply(commit_idx);
-        }
-    }
-
-    /// Appends and commits the ready value.
-    #[inline]
-    pub fn advance_append(&mut self, rd: Ready) {
-        self.commit_ready(rd);
-    }
-
-    /// Advance apply to the passed index.
-    #[inline]
-    pub fn advance_apply(&mut self, applied: u64) {
-        self.commit_apply(applied);
     }
 
     /// Status returns the current status of the given group.
@@ -545,6 +265,318 @@ impl<T: Storage> RawNode<T> {
     #[inline]
     pub fn set_batch_append(&mut self, batch_append: bool) {
         self.raft.set_batch_append(batch_append)
+    }
+}
+
+/// Ready encapsulates the entries and messages that are ready to read,
+/// be saved to stable storage, committed or sent to other peers.
+#[derive(Default, Debug, PartialEq)]
+pub struct Ready {
+    ss: Option<SoftState>,
+
+    hs: Option<HardState>,
+
+    read_states: Vec<ReadState>,
+
+    entries: Vec<Entry>,
+
+    snapshot: Snapshot,
+
+    /// CommittedEntries specifies entries to be committed to a
+    /// store/state-machine. These have previously been committed to stable
+    /// store.
+    pub committed_entries: Option<Vec<Entry>>,
+
+    /// Messages specifies outbound messages to be sent AFTER Entries are
+    /// committed to stable storage.
+    /// If it contains a MsgSnap message, the application MUST report back to raft
+    /// when the snapshot has been received or has failed by calling ReportSnapshot.
+    pub messages: Vec<Message>,
+
+    must_sync: bool,
+}
+
+impl Ready {
+    fn new<T: Storage>(
+        raft: &mut Raft<T>,
+        prev_ss: &SoftState,
+        prev_hs: &HardState,
+        since_idx: Option<(u64, Option<u64>)>,
+    ) -> Ready {
+        let mut rd = Ready {
+            entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
+            ..Default::default()
+        };
+        if !raft.msgs.is_empty() {
+            mem::swap(&mut raft.msgs, &mut rd.messages);
+        }
+        rd.committed_entries = Some(
+            (match since_idx {
+                None => raft.raft_log.next_entries(),
+                Some((since_idx, synced_idx)) => {
+                    raft.raft_log.next_entries_since(since_idx, synced_idx)
+                }
+            })
+            .unwrap_or_else(Vec::new),
+        );
+        let ss = raft.soft_state();
+        if &ss != prev_ss {
+            rd.ss = Some(ss);
+        }
+        let hs = raft.hard_state_for_ready();
+        if &hs != prev_hs {
+            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
+                rd.must_sync = true;
+            }
+            rd.hs = Some(hs);
+        }
+        if raft.raft_log.unstable.snapshot.is_some() {
+            rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
+        }
+        if !raft.read_states.is_empty() {
+            rd.read_states = raft.read_states.clone();
+        }
+        rd
+    }
+
+    /// The current volatile state of a Node.
+    /// SoftState will be nil if there is no update.
+    /// It is not required to consume or store SoftState.
+    #[inline]
+    pub fn ss(&self) -> Option<&SoftState> {
+        self.ss.as_ref()
+    }
+
+    /// The current state of a Node to be saved to stable storage BEFORE
+    /// Messages are sent.
+    /// HardState will be equal to empty state if there is no update.
+    #[inline]
+    pub fn hs(&self) -> Option<&HardState> {
+        self.hs.as_ref()
+    }
+
+    /// States can be used for node to serve linearizable read requests locally
+    /// when its applied index is greater than the index in ReadState.
+    /// Note that the read_state will be returned when raft receives MsgReadIndex.
+    /// The returned is only valid for the request that requested to read.
+    #[inline]
+    pub fn read_states(&self) -> &[ReadState] {
+        &self.read_states
+    }
+
+    /// Entries specifies entries to be saved to stable storage BEFORE
+    /// Messages are sent.
+    #[inline]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Snapshot specifies the snapshot to be saved to stable storage.
+    #[inline]
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// MustSync indicates whether the HardState and Entries must be synchronously
+    /// written to disk or if an asynchronous write is permissible.
+    #[inline]
+    pub fn must_sync(&self) -> bool {
+        self.must_sync
+    }
+}
+
+/// RawNode is a thread-unsafe Node.
+/// The methods of this struct correspond to the methods of Node and are described
+/// more fully there.
+pub struct RawNode<T: Storage> {
+    /// The internal raft state.
+    pub core: RawNodeRaft<T>,
+    prev_ss: SoftState,
+    prev_hs: HardState,
+}
+
+impl<T: Storage> Deref for RawNode<T> {
+    type Target = RawNodeRaft<T>;
+
+    fn deref(&self) -> &RawNodeRaft<T> {
+        &self.core
+    }
+}
+
+impl<T: Storage> DerefMut for RawNode<T> {
+    fn deref_mut(&mut self) -> &mut RawNodeRaft<T> {
+        &mut self.core
+    }
+}
+
+impl<T: Storage> RawNode<T> {
+    #[allow(clippy::new_ret_no_self)]
+    /// Create a new RawNode given some [`Config`](../struct.Config.html).
+    pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
+        let mut rn = RawNode {
+            core: RawNodeRaft::<T>::new(config, store, logger)?,
+            prev_hs: Default::default(),
+            prev_ss: Default::default(),
+        };
+        rn.prev_hs = rn.raft.hard_state();
+        rn.prev_ss = rn.raft.soft_state();
+        info!(
+            rn.raft.logger,
+            "RawNode created with id {id}.",
+            id = rn.raft.id
+        );
+        Ok(rn)
+    }
+
+    /// Create a new RawNode given some [`Config`](../struct.Config.html) and the default logger.
+    ///
+    /// The default logger is an `slog` to `log` adapter.
+    #[cfg(feature = "default-logger")]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn with_default_logger(c: &Config, store: T) -> Result<Self> {
+        Self::new(c, store, &crate::default_logger())
+    }
+
+    fn commit_ready(&mut self, rd: Ready) {
+        if rd.ss.is_some() {
+            self.prev_ss = rd.ss.unwrap();
+        }
+        if let Some(e) = rd.hs {
+            if e != HardState::default() {
+                self.prev_hs = e;
+            }
+        }
+        if !rd.entries.is_empty() {
+            let e = rd.entries.last().unwrap();
+            self.raft.raft_log.stable_to(e.index, e.term);
+            self.raft.on_sync_entries(e.index, e.term);
+        }
+        if rd.snapshot != Snapshot::default() {
+            self.raft
+                .raft_log
+                .stable_snap_to(rd.snapshot.get_metadata().index);
+        }
+        if !rd.read_states.is_empty() {
+            self.raft.read_states.clear();
+        }
+    }
+
+    /// Given an index, creates a new Ready value from that index.
+    pub fn ready_since(&mut self, applied_idx: u64) -> Ready {
+        Ready::new(
+            &mut self.core.raft,
+            &self.prev_ss,
+            &self.prev_hs,
+            Some((applied_idx, None)),
+        )
+    }
+
+    /// Given an range, creates a new Ready value from that index.
+    pub fn ready_from_range(&mut self, applied_idx: u64, synced_idx: u64) -> Ready {
+        Ready::new(
+            &mut self.core.raft,
+            &self.prev_ss,
+            &self.prev_hs,
+            Some((applied_idx, Some(synced_idx))),
+        )
+    }
+
+    /// Ready returns the current point-in-time state of this RawNode.
+    pub fn ready(&mut self) -> Ready {
+        Ready::new(&mut self.core.raft, &self.prev_ss, &self.prev_hs, None)
+    }
+
+    /// Return if fetch ready, it will need to be synced immediately
+    pub fn has_must_immediate_sync_ready(&mut self) -> bool {
+        let raft = &self.raft;
+        let hs = raft.hard_state_for_ready();
+        let prev_hs = &self.prev_hs;
+        if &hs != prev_hs {
+            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_has_ready(&self, applied_idx: Option<(u64, Option<u64>)>) -> bool {
+        let raft = &self.raft;
+        if !raft.msgs.is_empty() || raft.raft_log.unstable_entries().is_some() {
+            return true;
+        }
+        if !raft.read_states.is_empty() {
+            return true;
+        }
+        if self.snap().map_or(false, |s| !s.is_empty()) {
+            return true;
+        }
+        let has_unapplied_entries = match applied_idx {
+            None => raft.raft_log.has_next_entries(),
+            Some((applied_idx, synced_idx)) => raft
+                .raft_log
+                .has_next_entries_since(applied_idx, synced_idx),
+        };
+        if has_unapplied_entries {
+            return true;
+        }
+        if raft.soft_state() != self.prev_ss {
+            return true;
+        }
+        let hs = raft.hard_state_for_ready();
+        if hs != HardState::default() && hs != self.prev_hs {
+            return true;
+        }
+        false
+    }
+
+    /// Given an index, can determine if there is a ready state from that time.
+    #[inline]
+    pub fn has_ready_since(&self, applied_idx: u64) -> bool {
+        self.check_has_ready(Some((applied_idx, None)))
+    }
+
+    /// Given an index range, can determine if there is a ready state between that time span.
+    #[inline]
+    pub fn has_ready_from_range(&self, applied_idx: u64, synced_idx: u64) -> bool {
+        self.check_has_ready(Some((applied_idx, Some(synced_idx))))
+    }
+
+    /// HasReady called when RawNode user need to check if any Ready pending.
+    /// Checking logic in this method should be consistent with Ready.containsUpdates().
+    #[inline]
+    pub fn has_ready(&self) -> bool {
+        self.check_has_ready(None)
+    }
+
+    /// Advance notifies the RawNode that the application has applied and saved progress in the
+    /// last Ready results.
+    pub fn advance(&mut self, rd: Ready) {
+        self.advance_append(rd);
+        let commit_idx = self.prev_hs.commit;
+        if commit_idx != 0 {
+            // In most cases, prevHardSt and rd.HardState will be the same
+            // because when there are new entries to apply we just sent a
+            // HardState with an updated Commit value. However, on initial
+            // startup the two are different because we don't send a HardState
+            // until something changes, but we do send any un-applied but
+            // committed entries (and previously-committed entries may be
+            // incorporated into the snapshot, even if rd.CommittedEntries is
+            // empty). Therefore we mark all committed entries as applied
+            // whether they were included in rd.HardState or not.
+            self.advance_apply(commit_idx);
+        }
+    }
+
+    /// Appends and commits the ready value.
+    #[inline]
+    pub fn advance_append(&mut self, rd: Ready) {
+        self.commit_ready(rd);
+    }
+
+    /// Advance apply to the passed index.
+    #[inline]
+    pub fn advance_apply(&mut self, applied: u64) {
+        self.commit_apply(applied);
     }
 }
 

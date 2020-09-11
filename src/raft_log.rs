@@ -355,7 +355,11 @@ impl<T: Storage> RaftLog<T> {
     }
 
     /// Returns any entries since the a particular index.
-    pub fn next_entries_since(&self, since_idx: u64, synced_idx: Option<u64>) -> Option<Vec<Entry>> {
+    pub fn next_entries_since(
+        &self,
+        since_idx: u64,
+        synced_idx: Option<u64>,
+    ) -> Option<Vec<Entry>> {
         let offset = cmp::max(since_idx + 1, self.first_index());
         let high = match synced_idx {
             Some(synced_idx) => cmp::min(synced_idx, self.committed) + 1,

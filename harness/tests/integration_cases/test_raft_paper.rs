@@ -1035,10 +1035,12 @@ fn test_leader_only_commits_log_from_current_term() {
         m.term = r.term;
         m.index = index;
         r.step(m).expect("");
-        if r.raft_log.committed != wcommit {
+        if r.commit_index_after_sync_log() != wcommit {
             panic!(
                 "#{}: commit = {}, want {}",
-                i, r.raft_log.committed, wcommit
+                i,
+                r.commit_index_after_sync_log(),
+                wcommit,
             );
         }
     }
