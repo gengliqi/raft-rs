@@ -44,11 +44,14 @@ pub struct ReadyAsync {
 
     hs: Option<HardState>,
 
+    // TODO: add pub
     read_states: Vec<ReadState>,
 
-    entries: Vec<Entry>,
+    /// Entries specifies entries to be saved to stable storage
+    pub entries: Vec<Entry>,
 
-    snapshot: Snapshot,
+    /// Snapshot specifies the snapshot to be applied to application
+    pub snapshot: Snapshot,
 
     /// CommittedEntries specifies entries to be committed to a
     /// store/state-machine. These have previously been committed to stable
@@ -62,17 +65,52 @@ pub struct ReadyAsync {
     pub messages: Vec<Vec<Message>>,
 }
 
+impl ReadyAsync {
+    /// The number of current ReadyAsync.
+    /// It is used for .
+    #[inline]
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// The current volatile state of a Node.
+    /// SoftState will be nil if there is no update.
+    /// It is not required to consume or store SoftState.
+    #[inline]
+    pub fn ss(&self) -> Option<&SoftState> {
+        self.ss.as_ref()
+    }
+
+    /// The current state of a Node to be saved to stable storage BEFORE
+    /// Messages are sent.
+    /// HardState will be equal to empty state if there is no update.
+    #[inline]
+    pub fn hs(&self) -> Option<&HardState> {
+        self.hs.as_ref()
+    }
+
+    /// States can be used for node to serve linearizable read requests locally
+    /// when its applied index is greater than the index in ReadState.
+    /// Note that the read_state will be returned when raft receives MsgReadIndex.
+    /// The returned is only valid for the request that requested to read.
+    #[inline]
+    pub fn read_states(&self) -> &[ReadState] {
+        &self.read_states
+    }
+}
+
 /// ReadyAsyncRecord encapsulates the needed data for sync reply
 #[derive(Default, Debug, PartialEq)]
 struct ReadyAsyncRecord {
     number: u64,
+    // (index, term) of the last entry from the entries in ReadyAsync
     last_log: Option<(u64, u64)>,
     snapshot: Snapshot,
     messages: Vec<Message>,
 }
 
-/// SyncLastResult encapsulates the committed entries and messages that are ready to be applied
-/// or be sent to other peers.
+/// SyncLastResult encapsulates the committed entries and messages that are ready to
+/// be applied or be sent to other peers.
 #[derive(Default, Debug, PartialEq)]
 pub struct SyncLastResult {
     /// CommittedEntries specifies entries to be committed to a
@@ -80,10 +118,7 @@ pub struct SyncLastResult {
     /// store.
     pub committed_entries: Option<Vec<Entry>>,
 
-    /// Messages specifies outbound messages to be sent AFTER Entries are
-    /// committed to stable storage.
-    /// If it contains a MsgSnap message, the application MUST report back to raft
-    /// when the snapshot has been received or has failed by calling ReportSnapshot.
+    /// Messages specifies outbound messages to be sent
     pub messages: Vec<Vec<Message>>,
 }
 
@@ -96,8 +131,10 @@ pub struct RawNodeAsync<T: Storage> {
     prev_hs: HardState,
     records: VecDeque<ReadyAsyncRecord>,
     max_number: u64,
-    // (index, term) of synced last log
-    synced_last_log: (u64, u64),
+    // TODO: think twice
+    has_snapshot: bool,
+    // Index of last synced log
+    last_synced_index: u64,
     // Messages that need to be sent to other peers
     messages: Vec<Vec<Message>>,
 }
@@ -126,10 +163,11 @@ impl<T: Storage> RawNodeAsync<T> {
             prev_ss: Default::default(),
             records: VecDeque::new(),
             max_number: 0,
-            synced_last_log: (0, 0),
+            has_snapshot: false,
+            last_synced_index: 0,
             messages: Vec::new(),
         };
-        rn.synced_last_log = (rn.raft.raft_log.last_index(), rn.raft.raft_log.last_term());
+        rn.last_synced_index = rn.raft.raft_log.last_index();
         rn.prev_hs = rn.raft.hard_state();
         rn.prev_ss = rn.raft.soft_state();
         info!(
@@ -152,25 +190,67 @@ impl<T: Storage> RawNodeAsync<T> {
     /// Given an index, creates a new Ready value from that index.
     pub fn ready_since(&mut self, applied_idx: u64) -> ReadyAsync {
         let raft = &mut self.core.raft;
+
         self.max_number += 1;
         let number = self.max_number;
-        if self.prev_ss.raft_state != StateRole::Leader && raft.state == StateRole::Leader {
-            // TODO: clean up ReadyAsyncRecord
-        }
-
         let mut rd = ReadyAsync {
             number,
-            entries: raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec(),
             ..Default::default()
         };
         let mut rd_record = ReadyAsyncRecord {
             number,
             ..Default::default()
         };
+
+        if self.has_snapshot {
+            self.records.push_back(rd_record);
+            return rd;
+        }
+
+        if self.prev_ss.raft_state != StateRole::Leader && raft.state == StateRole::Leader {
+            // TODO: Add annotations
+            assert_eq!(self.prev_ss.raft_state, StateRole::Candidate);
+            for record in self.records.drain(..) {
+                assert_eq!(record.last_log, None);
+                assert!(record.snapshot.is_empty());
+                if !record.messages.is_empty() {
+                    self.messages.push(record.messages);
+                }
+            }
+            self.has_snapshot = false;
+        }
+
+        let ss = raft.soft_state();
+        if ss != self.prev_ss {
+            rd.ss = Some(ss);
+        }
+        let hs = raft.hard_state();
+        if hs != self.prev_hs {
+            rd.hs = Some(hs);
+        }
+
+        if !raft.read_states.is_empty() {
+            rd.read_states = raft.read_states.clone();
+        }
+
+        rd.entries = raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec();
         if let Some(e) = rd.entries.last() {
             rd_record.last_log = Some((e.get_index(), e.get_term()));
         }
-        mem::swap(&mut self.messages, &mut rd.messages);
+
+        if raft.raft_log.unstable.snapshot.is_some() {
+            rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
+            rd_record.snapshot = rd.snapshot.clone();
+            self.has_snapshot = true;
+        }
+
+        rd.committed_entries = raft
+            .raft_log
+            .next_entries_since(applied_idx, Some(self.last_synced_index));
+
+        if !self.messages.is_empty() {
+            mem::swap(&mut self.messages, &mut rd.messages);
+        }
         if !raft.msgs.is_empty() {
             if raft.state == StateRole::Leader {
                 let mut msgs = Vec::new();
@@ -180,45 +260,68 @@ impl<T: Storage> RawNodeAsync<T> {
                 mem::swap(&mut raft.msgs, &mut rd_record.messages);
             }
         }
-        rd.committed_entries = raft
-            .raft_log
-            .next_entries_since(applied_idx, Some(self.synced_last_log.0));
-        let ss = raft.soft_state();
-        if ss != self.prev_ss {
-            rd.ss = Some(ss);
-        }
-        let hs = raft.hard_state_for_ready();
-        if hs != self.prev_hs {
-            rd.hs = Some(hs);
-        }
-        if raft.raft_log.unstable.snapshot.is_some() {
-            rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
-            rd_record.snapshot = rd.snapshot.clone();
-        }
-        if !raft.read_states.is_empty() {
-            rd.read_states = raft.read_states.clone();
-        }
         self.records.push_back(rd_record);
         rd
     }
 
+    fn check_has_ready(&self, applied_idx: Option<u64>) -> bool {
+        if self.has_snapshot {
+            return false;
+        }
+        let raft = &self.raft;
+        if raft.soft_state() != self.prev_ss {
+            return true;
+        }
+        let hs = raft.hard_state();
+        if hs != HardState::default() && hs != self.prev_hs {
+            return true;
+        }
+
+        if !raft.read_states.is_empty() {
+            return true;
+        }
+
+        if raft.raft_log.unstable_entries().is_some() {
+            return true;
+        }
+
+        if self.snap().map_or(false, |s| !s.is_empty()) {
+            return true;
+        }
+
+        let has_unapplied_entries = match applied_idx {
+            None => raft.raft_log.has_next_entries(),
+            Some(applied_idx) => raft.raft_log.has_next_entries_since(applied_idx, None),
+        };
+        if has_unapplied_entries {
+            return true;
+        }
+
+        if !raft.msgs.is_empty() || !self.messages.is_empty() {
+            return true;
+        }
+        false
+    }
+
+    /// Given an index, can determine if there is a ready state from that time.
+    #[inline]
+    pub fn has_ready_since(&self, applied_idx: u64) -> bool {
+        self.check_has_ready(Some(applied_idx))
+    }
+
     fn commit_ready(&mut self, rd: ReadyAsync) {
+        let rd_record = self.records.back().unwrap();
+        assert!(rd_record.number == rd.number);
         if rd.ss.is_some() {
             self.prev_ss = rd.ss.unwrap();
         }
-        if let Some(e) = rd.hs {
-            if e != HardState::default() {
-                self.prev_hs = e;
+        if let Some(hs) = rd.hs {
+            if hs != HardState::default() {
+                self.prev_hs = hs;
             }
         }
-        if !rd.entries.is_empty() {
-            let e = rd.entries.last().unwrap();
-            self.raft.raft_log.stable_to(e.index, e.term);
-        }
-        if rd.snapshot != Snapshot::default() {
-            self.raft
-                .raft_log
-                .stable_snap_to(rd.snapshot.get_metadata().index);
+        if let Some(e) = rd_record.last_log {
+            self.raft.raft_log.stable_to(e.0, e.1);
         }
         if !rd.read_states.is_empty() {
             self.raft.read_states.clear();
@@ -254,25 +357,32 @@ impl<T: Storage> RawNodeAsync<T> {
             };
             if let Some(last_log) = record.last_log {
                 self.raft.on_sync_entries(last_log.0, last_log.1);
-                self.synced_last_log = last_log;
+                self.last_synced_index = last_log.0;
             }
-            self.raft
-                .raft_log
-                .stable_snap_to(record.snapshot.get_metadata().index);
-            self.messages.push(record.messages);
+            if !record.snapshot.is_empty() {
+                self.raft
+                    .raft_log
+                    .stable_snap_to(record.snapshot.get_metadata().index);
+                self.has_snapshot = false;
+            }
+            if !record.messages.is_empty() {
+                self.messages.push(record.messages);
+            }
         }
     }
 
     /// Sync the last ready and get the SyncLastResult
     pub fn synced_last_ready(&mut self, applied_idx: u64) -> SyncLastResult {
         self.synced_ready(self.max_number);
+
         let raft = &mut self.core.raft;
         let mut res = SyncLastResult {
             committed_entries: raft
                 .raft_log
-                .next_entries_since(applied_idx, Some(self.synced_last_log.0)),
+                .next_entries_since(applied_idx, Some(self.last_synced_index)),
             messages: vec![],
         };
+
         mem::swap(&mut res.messages, &mut self.messages);
         if !raft.msgs.is_empty() && raft.state == StateRole::Leader {
             let mut msgs = Vec::new();

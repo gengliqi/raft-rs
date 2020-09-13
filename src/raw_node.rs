@@ -448,7 +448,7 @@ impl<T: Storage> RawNode<T> {
             self.raft.raft_log.stable_to(e.index, e.term);
             self.raft.on_sync_entries(e.index, e.term);
         }
-        if rd.snapshot != Snapshot::default() {
+        if !rd.snapshot.is_empty() {
             self.raft
                 .raft_log
                 .stable_snap_to(rd.snapshot.get_metadata().index);
@@ -477,7 +477,7 @@ impl<T: Storage> RawNode<T> {
         Ready::new(&mut self.core.raft, &self.prev_ss, &self.prev_hs, None)
     }
 
-    fn check_has_ready(&self, applied_idx: Option<(u64, Option<u64>)>) -> bool {
+    fn check_has_ready(&self, applied_idx: Option<u64>) -> bool {
         let raft = &self.raft;
         if !raft.msgs.is_empty() || raft.raft_log.unstable_entries().is_some() {
             return true;
@@ -490,9 +490,7 @@ impl<T: Storage> RawNode<T> {
         }
         let has_unapplied_entries = match applied_idx {
             None => raft.raft_log.has_next_entries(),
-            Some((applied_idx, synced_idx)) => raft
-                .raft_log
-                .has_next_entries_since(applied_idx, synced_idx),
+            Some(applied_idx) => raft.raft_log.has_next_entries_since(applied_idx, None),
         };
         if has_unapplied_entries {
             return true;
@@ -510,13 +508,7 @@ impl<T: Storage> RawNode<T> {
     /// Given an index, can determine if there is a ready state from that time.
     #[inline]
     pub fn has_ready_since(&self, applied_idx: u64) -> bool {
-        self.check_has_ready(Some((applied_idx, None)))
-    }
-
-    /// Given an index range, can determine if there is a ready state between that time span.
-    #[inline]
-    pub fn has_ready_from_range(&self, applied_idx: u64, synced_idx: u64) -> bool {
-        self.check_has_ready(Some((applied_idx, Some(synced_idx))))
+        self.check_has_ready(Some(applied_idx))
     }
 
     /// HasReady called when RawNode user need to check if any Ready pending.
