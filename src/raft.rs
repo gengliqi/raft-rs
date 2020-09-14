@@ -843,22 +843,23 @@ impl<T: Storage> Raft<T> {
         }
         self.raft_log.append(es);
 
-        // Not move on self's pr.matched until self.on_sync_entries
+        // Not move on self's pr.matched until on_persist_entries
     }
 
-    /// Notify that raft_log was well persisted
-    pub fn on_sync_entries(&mut self, synced_index: u64, synced_term: u64) {
+    /// Notifies that raft_log has been well persisted
+    pub fn on_persist_entries(&mut self, persisted_index: u64, persisted_term: u64) {
         if self.state == StateRole::Leader
             && self
                 .raft_log
-                .term(synced_index)
-                .map_or(false, |t| t == synced_term)
+                .term(persisted_index)
+                .map_or(false, |t| t == persisted_term)
         {
             let self_id = self.id;
             let pr = self.mut_prs().get_mut(self_id).unwrap();
-            pr.maybe_update(synced_index);
-            // Regardless of maybe_commit's return, our caller will call bcastAppend.
-            self.maybe_commit();
+            pr.maybe_update(persisted_index);
+            if self.maybe_commit() && self.should_bcast_commit() {
+                self.bcast_append();
+            }
         }
     }
 

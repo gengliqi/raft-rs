@@ -27,15 +27,16 @@ use std::{
 };
 
 use crate::config::Config;
-use crate::eraftpb::{Entry, EntryType, HardState, Message, MessageType, Snapshot};
-use crate::errors::{Error, Result};
+use crate::eraftpb::{Entry, HardState, Message, Snapshot};
+use crate::errors::Result;
 use crate::raw_node::RawNodeRaft;
 use crate::read_only::ReadState;
-use crate::{Raft, SoftState, StateRole, Status, Storage, INVALID_ID};
+use crate::{SoftState, StateRole, Storage};
 use slog::Logger;
 
 /// ReadyAsync encapsulates the entries and messages that are ready to read,
 /// be saved to stable storage, committed or sent to other peers.
+/// Note that the ReadyAsync MUST BE persisted sequentially.
 #[derive(Default, Debug, PartialEq)]
 pub struct ReadyAsync {
     number: u64,
@@ -44,13 +45,13 @@ pub struct ReadyAsync {
 
     hs: Option<HardState>,
 
-    // TODO: change it to public
-    read_states: Vec<ReadState>,
+    /// ReadStates specifies the state for read only query.
+    pub read_states: Vec<ReadState>,
 
-    /// Entries specifies entries to be saved to stable storage
+    /// Entries specifies entries to be saved to stable storage.
     pub entries: Vec<Entry>,
 
-    /// Snapshot specifies the snapshot to be applied to application
+    /// Snapshot specifies the snapshot to be applied to application.
     pub snapshot: Snapshot,
 
     /// CommittedEntries specifies entries to be committed to a
@@ -67,7 +68,7 @@ pub struct ReadyAsync {
 
 impl ReadyAsync {
     /// The number of current ReadyAsync.
-    /// It is used for .
+    /// It is used for identifying the different ReadyAsync and ReadyAsyncRecord.
     #[inline]
     pub fn number(&self) -> u64 {
         self.number
@@ -88,15 +89,6 @@ impl ReadyAsync {
     pub fn hs(&self) -> Option<&HardState> {
         self.hs.as_ref()
     }
-
-    /// States can be used for node to serve linearizable read requests locally
-    /// when its applied index is greater than the index in ReadState.
-    /// Note that the read_state will be returned when raft receives MsgReadIndex.
-    /// The returned is only valid for the request that requested to read.
-    #[inline]
-    pub fn read_states(&self) -> &[ReadState] {
-        &self.read_states
-    }
 }
 
 /// ReadyAsyncRecord encapsulates the needed data for sync reply
@@ -109,10 +101,10 @@ struct ReadyAsyncRecord {
     messages: Vec<Message>,
 }
 
-/// SyncLastResult encapsulates the committed entries and messages that are ready to
+/// PersistResult encapsulates the committed entries and messages that are ready to
 /// be applied or be sent to other peers.
 #[derive(Default, Debug, PartialEq)]
-pub struct SyncLastResult {
+pub struct PersistResult {
     /// CommittedEntries specifies entries to be committed to a
     /// store/state-machine. These have previously been committed to stable
     /// store.
@@ -129,10 +121,13 @@ pub struct RawNodeAsync<T: Storage> {
     core: RawNodeRaft<T>,
     prev_ss: SoftState,
     prev_hs: HardState,
-    records: VecDeque<ReadyAsyncRecord>,
+    // Current max number of RecordAsync and ReadyAsyncRecord.
     max_number: u64,
-    // Index of last synced log
-    last_synced_index: u64,
+    records: VecDeque<ReadyAsyncRecord>,
+    // If there is a pending snapshot.
+    pending_snapshot: bool,
+    // Index of last persisted log
+    last_persisted_index: u64,
     // Messages that need to be sent to other peers
     messages: Vec<Vec<Message>>,
 }
@@ -153,18 +148,19 @@ impl<T: Storage> DerefMut for RawNodeAsync<T> {
 
 impl<T: Storage> RawNodeAsync<T> {
     #[allow(clippy::new_ret_no_self)]
-    /// Create a new RawNode given some [`Config`](../struct.Config.html).
+    /// Create a new RawNodeAsync given some [`Config`](../struct.Config.html).
     pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
         let mut rn = RawNodeAsync {
             core: RawNodeRaft::<T>::new(config, store, logger)?,
             prev_hs: Default::default(),
             prev_ss: Default::default(),
-            records: VecDeque::new(),
             max_number: 0,
-            last_synced_index: 0,
+            records: VecDeque::new(),
+            pending_snapshot: false,
+            last_persisted_index: 0,
             messages: Vec::new(),
         };
-        rn.last_synced_index = rn.raft.raft_log.last_index();
+        rn.last_persisted_index = rn.raft.raft_log.last_index();
         rn.prev_hs = rn.raft.hard_state();
         rn.prev_ss = rn.raft.soft_state();
         info!(
@@ -175,7 +171,7 @@ impl<T: Storage> RawNodeAsync<T> {
         Ok(rn)
     }
 
-    /// Create a new RawNode given some [`Config`](../struct.Config.html) and the default logger.
+    /// Create a new RawNodeAsync given some [`Config`](../struct.Config.html) and the default logger.
     ///
     /// The default logger is an `slog` to `log` adapter.
     #[cfg(feature = "default-logger")]
@@ -184,20 +180,25 @@ impl<T: Storage> RawNodeAsync<T> {
         Self::new(c, store, &crate::default_logger())
     }
 
-    /// Given an index, creates a new Ready value from that index.
+    /// Given an index, creates a new ReadyAsync value from that index.
     pub fn ready_since(&mut self, applied_idx: u64) -> ReadyAsync {
         let raft = &mut self.core.raft;
 
         self.max_number += 1;
-        let number = self.max_number;
         let mut rd = ReadyAsync {
-            number,
+            number: self.max_number,
             ..Default::default()
         };
         let mut rd_record = ReadyAsyncRecord {
-            number,
+            number: self.max_number,
             ..Default::default()
         };
+
+        // If there is a pending snapshot, do not get the whole ReadyAsync
+        if self.pending_snapshot {
+            self.records.push_back(rd_record);
+            return rd;
+        }
 
         if self.prev_ss.raft_state != StateRole::Leader && raft.state == StateRole::Leader {
             // TODO: Add more annotations
@@ -221,7 +222,7 @@ impl<T: Storage> RawNodeAsync<T> {
         }
 
         if !raft.read_states.is_empty() {
-            rd.read_states = raft.read_states.clone();
+            mem::swap(&mut raft.read_states, &mut rd.read_states);
         }
 
         rd.entries = raft.raft_log.unstable_entries().unwrap_or(&[]).to_vec();
@@ -232,11 +233,12 @@ impl<T: Storage> RawNodeAsync<T> {
         if raft.raft_log.unstable.snapshot.is_some() {
             rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
             rd_record.snapshot = rd.snapshot.clone();
+            self.pending_snapshot = true;
         }
 
         rd.committed_entries = raft
             .raft_log
-            .next_entries_since(applied_idx, Some(self.last_synced_index));
+            .next_entries_since(applied_idx, Some(self.last_persisted_index));
 
         if !self.messages.is_empty() {
             mem::swap(&mut self.messages, &mut rd.messages);
@@ -256,11 +258,17 @@ impl<T: Storage> RawNodeAsync<T> {
 
     fn check_has_ready(&self, applied_idx: Option<u64>) -> bool {
         let raft = &self.raft;
+        if self.pending_snapshot {
+            // If there is a pending snapshot, there is no ready.
+            return false;
+        }
         if raft.soft_state() != self.prev_ss {
             return true;
         }
-        let hs = raft.hard_state();
-        if hs != HardState::default() && hs != self.prev_hs {
+        let mut hs = raft.hard_state();
+        // Do not care about the commit index change.
+        hs.commit = self.prev_hs.commit;
+        if hs != self.prev_hs {
             return true;
         }
 
@@ -297,8 +305,6 @@ impl<T: Storage> RawNodeAsync<T> {
     }
 
     fn commit_ready(&mut self, rd: ReadyAsync) {
-        let rd_record = self.records.back().unwrap();
-        assert!(rd_record.number == rd.number);
         if rd.ss.is_some() {
             self.prev_ss = rd.ss.unwrap();
         }
@@ -307,11 +313,10 @@ impl<T: Storage> RawNodeAsync<T> {
                 self.prev_hs = hs;
             }
         }
+        let rd_record = self.records.back().unwrap();
+        assert!(rd_record.number == rd.number);
         if let Some(e) = rd_record.last_log {
             self.raft.raft_log.stable_to(e.0, e.1);
-        }
-        if !rd.read_states.is_empty() {
-            self.raft.read_states.clear();
         }
     }
 
@@ -331,8 +336,8 @@ impl<T: Storage> RawNodeAsync<T> {
         self.commit_apply(applied);
     }
 
-    /// Sync the ready
-    pub fn synced_ready(&mut self, number: u64) {
+    /// Notifies that the ready of this number has been well persisted.
+    pub fn on_persist_ready(&mut self, number: u64) {
         loop {
             let record = if let Some(record) = self.records.pop_front() {
                 if record.number > number {
@@ -343,13 +348,14 @@ impl<T: Storage> RawNodeAsync<T> {
                 break;
             };
             if let Some(last_log) = record.last_log {
-                self.raft.on_sync_entries(last_log.0, last_log.1);
-                self.last_synced_index = last_log.0;
+                self.raft.on_persist_entries(last_log.0, last_log.1);
+                self.last_persisted_index = last_log.0;
             }
             if !record.snapshot.is_empty() {
                 self.raft
                     .raft_log
                     .stable_snap_to(record.snapshot.get_metadata().index);
+                self.pending_snapshot = false;
             }
             if !record.messages.is_empty() {
                 self.messages.push(record.messages);
@@ -357,15 +363,16 @@ impl<T: Storage> RawNodeAsync<T> {
         }
     }
 
-    /// Sync the last ready and get the SyncLastResult
-    pub fn synced_last_ready(&mut self, applied_idx: u64) -> SyncLastResult {
-        self.synced_ready(self.max_number);
+    /// Notifies that the last ready has been well persisted.
+    /// Return a PersistResult
+    pub fn on_persist_last_ready(&mut self, applied_idx: u64) -> PersistResult {
+        self.on_persist_ready(self.max_number);
 
         let raft = &mut self.core.raft;
-        let mut res = SyncLastResult {
+        let mut res = PersistResult {
             committed_entries: raft
                 .raft_log
-                .next_entries_since(applied_idx, Some(self.last_synced_index)),
+                .next_entries_since(applied_idx, Some(self.last_persisted_index)),
             messages: vec![],
         };
 

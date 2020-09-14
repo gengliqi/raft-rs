@@ -389,7 +389,7 @@ impl Ready {
 /// more fully there.
 pub struct RawNode<T: Storage> {
     /// The internal raft state.
-    pub core: RawNodeRaft<T>,
+    core: RawNodeRaft<T>,
     prev_ss: SoftState,
     prev_hs: HardState,
 }
@@ -448,7 +448,7 @@ impl<T: Storage> RawNode<T> {
         if !rd.entries.is_empty() {
             let e = rd.entries.last().unwrap();
             self.raft.raft_log.stable_to(e.index, e.term);
-            self.raft.on_sync_entries(e.index, e.term);
+            self.raft.on_persist_entries(e.index, e.term);
         }
         if !rd.snapshot.is_empty() {
             self.raft
