@@ -309,17 +309,11 @@ impl Ready {
         if !raft.msgs.is_empty() {
             mem::swap(&mut raft.msgs, &mut rd.messages);
         }
-        rd.committed_entries = Some(
-            (match since_idx {
-                None => raft.raft_log.next_entries(),
-                Some(since_idx) => raft.raft_log.next_entries_since(since_idx, None),
-            })
-            .unwrap_or_else(Vec::new),
-        );
         let ss = raft.soft_state();
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
+        // TODO: Just for Singleton, maybe we can special judge it
         let hs = raft.hard_state_for_ready();
         if &hs != prev_hs {
             if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
@@ -327,6 +321,14 @@ impl Ready {
             }
             rd.hs = Some(hs);
         }
+        // TODO: Just for Singleton, should use the hs.commit
+        rd.committed_entries = Some(
+            (match since_idx {
+                None => raft.raft_log.next_entries(),
+                Some(since_idx) => raft.raft_log.next_entries_since(since_idx, None),
+            })
+            .unwrap_or_else(Vec::new),
+        );
         if raft.raft_log.unstable.snapshot.is_some() {
             rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
         }

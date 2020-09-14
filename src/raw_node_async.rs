@@ -44,7 +44,7 @@ pub struct ReadyAsync {
 
     hs: Option<HardState>,
 
-    // TODO: add pub
+    // TODO: change it to public
     read_states: Vec<ReadState>,
 
     /// Entries specifies entries to be saved to stable storage
@@ -131,8 +131,6 @@ pub struct RawNodeAsync<T: Storage> {
     prev_hs: HardState,
     records: VecDeque<ReadyAsyncRecord>,
     max_number: u64,
-    // TODO: think twice
-    has_snapshot: bool,
     // Index of last synced log
     last_synced_index: u64,
     // Messages that need to be sent to other peers
@@ -163,7 +161,6 @@ impl<T: Storage> RawNodeAsync<T> {
             prev_ss: Default::default(),
             records: VecDeque::new(),
             max_number: 0,
-            has_snapshot: false,
             last_synced_index: 0,
             messages: Vec::new(),
         };
@@ -202,13 +199,8 @@ impl<T: Storage> RawNodeAsync<T> {
             ..Default::default()
         };
 
-        if self.has_snapshot {
-            self.records.push_back(rd_record);
-            return rd;
-        }
-
         if self.prev_ss.raft_state != StateRole::Leader && raft.state == StateRole::Leader {
-            // TODO: Add annotations
+            // TODO: Add more annotations
             assert_eq!(self.prev_ss.raft_state, StateRole::Candidate);
             for record in self.records.drain(..) {
                 assert_eq!(record.last_log, None);
@@ -217,7 +209,6 @@ impl<T: Storage> RawNodeAsync<T> {
                     self.messages.push(record.messages);
                 }
             }
-            self.has_snapshot = false;
         }
 
         let ss = raft.soft_state();
@@ -241,7 +232,6 @@ impl<T: Storage> RawNodeAsync<T> {
         if raft.raft_log.unstable.snapshot.is_some() {
             rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
             rd_record.snapshot = rd.snapshot.clone();
-            self.has_snapshot = true;
         }
 
         rd.committed_entries = raft
@@ -265,9 +255,6 @@ impl<T: Storage> RawNodeAsync<T> {
     }
 
     fn check_has_ready(&self, applied_idx: Option<u64>) -> bool {
-        if self.has_snapshot {
-            return false;
-        }
         let raft = &self.raft;
         if raft.soft_state() != self.prev_ss {
             return true;
@@ -363,7 +350,6 @@ impl<T: Storage> RawNodeAsync<T> {
                 self.raft
                     .raft_log
                     .stable_snap_to(record.snapshot.get_metadata().index);
-                self.has_snapshot = false;
             }
             if !record.messages.is_empty() {
                 self.messages.push(record.messages);
