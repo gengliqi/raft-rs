@@ -365,12 +365,12 @@ impl<T: Storage> Raft<T> {
         let mut hs = HardState::default();
         hs.term = self.term;
         hs.vote = self.vote;
-        hs.commit = self.commit_index_after_sync_log();
+        hs.commit = self.commit_index_after_persist();
         hs
     }
 
-    /// Returns the expected commit index after sync all log
-    pub fn commit_index_after_sync_log(&self) -> u64 {
+    /// Returns the expected commit index after persisting all log
+    pub fn commit_index_after_persist(&self) -> u64 {
         if self.state != StateRole::Leader {
             return self.raft_log.committed;
         }

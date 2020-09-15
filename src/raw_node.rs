@@ -34,7 +34,7 @@ use crate::eraftpb::{
 };
 use crate::errors::{Error, Result};
 use crate::read_only::ReadState;
-use crate::{Raft, SoftState, StateRole, Status, Storage, INVALID_ID};
+use crate::{Raft, SoftState, Status, Storage, INVALID_ID};
 use slog::Logger;
 
 /// Represents a Peer node in the cluster.
@@ -313,7 +313,7 @@ impl Ready {
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
-        // TODO: Just for Singleton, maybe we can special judge it
+        // TODO: Just for Singleton, maybe we can special judge it?
         let hs = raft.hard_state_for_ready();
         if &hs != prev_hs {
             if hs.vote != prev_hs.vote || hs.term != prev_hs.term {

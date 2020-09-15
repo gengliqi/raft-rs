@@ -358,11 +358,11 @@ impl<T: Storage> RaftLog<T> {
     pub fn next_entries_since(
         &self,
         since_idx: u64,
-        synced_idx: Option<u64>,
+        persisted_idx: Option<u64>,
     ) -> Option<Vec<Entry>> {
         let offset = cmp::max(since_idx + 1, self.first_index());
-        let high = match synced_idx {
-            Some(synced_idx) => cmp::min(synced_idx, self.committed) + 1,
+        let high = match persisted_idx {
+            Some(persisted_idx) => cmp::min(persisted_idx, self.committed) + 1,
             None => self.committed + 1,
         };
         if high > offset {
@@ -382,10 +382,10 @@ impl<T: Storage> RaftLog<T> {
     }
 
     /// Returns whether there are entries that can be applied between `since_idx` and the comitted index.
-    pub fn has_next_entries_since(&self, since_idx: u64, synced_idx: Option<u64>) -> bool {
+    pub fn has_next_entries_since(&self, since_idx: u64, persisted_idx: Option<u64>) -> bool {
         let offset = cmp::max(since_idx + 1, self.first_index());
-        let high = match synced_idx {
-            Some(synced_idx) => cmp::min(synced_idx, self.committed) + 1,
+        let high = match persisted_idx {
+            Some(persisted_idx) => cmp::min(persisted_idx, self.committed) + 1,
             None => self.committed + 1,
         };
         high > offset

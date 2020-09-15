@@ -14,11 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The raw node async of the raft module.
+//! The async raw node of the raft module.
 //!
 //! This module contains the value types for the node and it's connection to other
 //! nodes but not the raft consensus itself. Generally, you'll interact with the
-//! RawNodeAsync first and use it to access the inner workings of the consensus protocol.
+//! AsyncRawNode first and use it to access the inner workings of the consensus protocol.
 
 use std::collections::VecDeque;
 use std::{
@@ -34,11 +34,11 @@ use crate::read_only::ReadState;
 use crate::{SoftState, StateRole, Storage};
 use slog::Logger;
 
-/// ReadyAsync encapsulates the entries and messages that are ready to read,
+/// AsyncReady encapsulates the entries and messages that are ready to read,
 /// be saved to stable storage, committed or sent to other peers.
-/// Note that the ReadyAsync MUST BE persisted sequentially.
+/// Note that the AsyncReady MUST BE persisted sequentially.
 #[derive(Default, Debug, PartialEq)]
-pub struct ReadyAsync {
+pub struct AsyncReady {
     number: u64,
 
     ss: Option<SoftState>,
@@ -66,9 +66,9 @@ pub struct ReadyAsync {
     pub messages: Vec<Vec<Message>>,
 }
 
-impl ReadyAsync {
-    /// The number of current ReadyAsync.
-    /// It is used for identifying the different ReadyAsync and ReadyAsyncRecord.
+impl AsyncReady {
+    /// The number of current AsyncReady.
+    /// It is used for identifying the different AsyncReady and AsyncReadyRecord.
     #[inline]
     pub fn number(&self) -> u64 {
         self.number
@@ -91,20 +91,20 @@ impl ReadyAsync {
     }
 }
 
-/// ReadyAsyncRecord encapsulates the needed data for sync reply
+/// AsyncReadyRecord encapsulates the needed data for sync reply
 #[derive(Default, Debug, PartialEq)]
-struct ReadyAsyncRecord {
+struct AsyncReadyRecord {
     number: u64,
-    // (index, term) of the last entry from the entries in ReadyAsync
+    // (index, term) of the last entry from the entries in AsyncReady
     last_log: Option<(u64, u64)>,
     snapshot: Snapshot,
     messages: Vec<Message>,
 }
 
-/// PersistResult encapsulates the committed entries and messages that are ready to
+/// PersistLastReadyResult encapsulates the committed entries and messages that are ready to
 /// be applied or be sent to other peers.
 #[derive(Default, Debug, PartialEq)]
-pub struct PersistResult {
+pub struct PersistLastReadyResult {
     /// CommittedEntries specifies entries to be committed to a
     /// store/state-machine. These have previously been committed to stable
     /// store.
@@ -114,16 +114,16 @@ pub struct PersistResult {
     pub messages: Vec<Vec<Message>>,
 }
 
-/// RawNodeAsync is a thread-unsafe Node.
+/// AsyncRawNode is a thread-unsafe Node.
 /// The methods of this struct correspond to the methods of Node and are described
 /// more fully there.
-pub struct RawNodeAsync<T: Storage> {
+pub struct AsyncRawNode<T: Storage> {
     core: RawNodeRaft<T>,
     prev_ss: SoftState,
     prev_hs: HardState,
-    // Current max number of RecordAsync and ReadyAsyncRecord.
+    // Current max number of RecordAsync and AsyncReadyRecord.
     max_number: u64,
-    records: VecDeque<ReadyAsyncRecord>,
+    records: VecDeque<AsyncReadyRecord>,
     // If there is a pending snapshot.
     pending_snapshot: bool,
     // Index of last persisted log
@@ -132,7 +132,7 @@ pub struct RawNodeAsync<T: Storage> {
     messages: Vec<Vec<Message>>,
 }
 
-impl<T: Storage> Deref for RawNodeAsync<T> {
+impl<T: Storage> Deref for AsyncRawNode<T> {
     type Target = RawNodeRaft<T>;
 
     fn deref(&self) -> &RawNodeRaft<T> {
@@ -140,17 +140,17 @@ impl<T: Storage> Deref for RawNodeAsync<T> {
     }
 }
 
-impl<T: Storage> DerefMut for RawNodeAsync<T> {
+impl<T: Storage> DerefMut for AsyncRawNode<T> {
     fn deref_mut(&mut self) -> &mut RawNodeRaft<T> {
         &mut self.core
     }
 }
 
-impl<T: Storage> RawNodeAsync<T> {
+impl<T: Storage> AsyncRawNode<T> {
     #[allow(clippy::new_ret_no_self)]
-    /// Create a new RawNodeAsync given some [`Config`](../struct.Config.html).
+    /// Create a new AsyncRawNode given some [`Config`](../struct.Config.html).
     pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
-        let mut rn = RawNodeAsync {
+        let mut rn = AsyncRawNode {
             core: RawNodeRaft::<T>::new(config, store, logger)?,
             prev_hs: Default::default(),
             prev_ss: Default::default(),
@@ -165,13 +165,13 @@ impl<T: Storage> RawNodeAsync<T> {
         rn.prev_ss = rn.raft.soft_state();
         info!(
             rn.raft.logger,
-            "RawNodeAsync created with id {id}.",
+            "AsyncRawNode created with id {id}.",
             id = rn.raft.id
         );
         Ok(rn)
     }
 
-    /// Create a new RawNodeAsync given some [`Config`](../struct.Config.html) and the default logger.
+    /// Create a new AsyncRawNode given some [`Config`](../struct.Config.html) and the default logger.
     ///
     /// The default logger is an `slog` to `log` adapter.
     #[cfg(feature = "default-logger")]
@@ -180,21 +180,21 @@ impl<T: Storage> RawNodeAsync<T> {
         Self::new(c, store, &crate::default_logger())
     }
 
-    /// Given an index, creates a new ReadyAsync value from that index.
-    pub fn ready_since(&mut self, applied_idx: u64) -> ReadyAsync {
+    /// Given an index, creates a new AsyncReady value from that index.
+    pub fn ready_since(&mut self, applied_idx: u64) -> AsyncReady {
         let raft = &mut self.core.raft;
 
         self.max_number += 1;
-        let mut rd = ReadyAsync {
+        let mut rd = AsyncReady {
             number: self.max_number,
             ..Default::default()
         };
-        let mut rd_record = ReadyAsyncRecord {
+        let mut rd_record = AsyncReadyRecord {
             number: self.max_number,
             ..Default::default()
         };
 
-        // If there is a pending snapshot, do not get the whole ReadyAsync
+        // If there is a pending snapshot, do not get the whole AsyncReady
         if self.pending_snapshot {
             self.records.push_back(rd_record);
             return rd;
@@ -257,11 +257,11 @@ impl<T: Storage> RawNodeAsync<T> {
     }
 
     fn check_has_ready(&self, applied_idx: Option<u64>) -> bool {
-        let raft = &self.raft;
         if self.pending_snapshot {
             // If there is a pending snapshot, there is no ready.
             return false;
         }
+        let raft = &self.raft;
         if raft.soft_state() != self.prev_ss {
             return true;
         }
@@ -304,7 +304,7 @@ impl<T: Storage> RawNodeAsync<T> {
         self.check_has_ready(Some(applied_idx))
     }
 
-    fn commit_ready(&mut self, rd: ReadyAsync) {
+    fn commit_ready(&mut self, rd: AsyncReady) {
         if rd.ss.is_some() {
             self.prev_ss = rd.ss.unwrap();
         }
@@ -326,7 +326,7 @@ impl<T: Storage> RawNodeAsync<T> {
 
     /// Appends and commits the ready value.
     #[inline]
-    pub fn advance_append(&mut self, rd: ReadyAsync) {
+    pub fn advance_append(&mut self, rd: AsyncReady) {
         self.commit_ready(rd);
     }
 
@@ -364,12 +364,13 @@ impl<T: Storage> RawNodeAsync<T> {
     }
 
     /// Notifies that the last ready has been well persisted.
-    /// Return a PersistResult
-    pub fn on_persist_last_ready(&mut self, applied_idx: u64) -> PersistResult {
+    /// Returns the PersistLastReadyResult that contains committed entries and messages.
+    /// Note that it must be called after handling the last AsyncReady.
+    pub fn on_persist_last_ready(&mut self, applied_idx: u64) -> PersistLastReadyResult {
         self.on_persist_ready(self.max_number);
 
         let raft = &mut self.core.raft;
-        let mut res = PersistResult {
+        let mut res = PersistLastReadyResult {
             committed_entries: raft
                 .raft_log
                 .next_entries_since(applied_idx, Some(self.last_persisted_index)),

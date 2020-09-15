@@ -480,7 +480,7 @@ pub mod raft;
 mod raft;
 mod raft_log;
 pub mod raw_node;
-pub mod raw_node_async;
+pub mod async_raw_node;
 mod read_only;
 mod status;
 pub mod storage;
