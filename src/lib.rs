@@ -440,7 +440,7 @@ before taking old, removed peers offline.
 #![deny(missing_docs)]
 #![recursion_limit = "128"]
 // This is necessary to support prost and rust-protobuf at the same time.
-#![allow(clippy::identity_conversion)]
+#![allow(clippy::useless_conversion)]
 // This lint recommends some bad choices sometimes.
 #![allow(clippy::unnecessary_unwrap)]
 
@@ -470,30 +470,33 @@ macro_rules! fatal {
     }};
 }
 
+pub mod async_raw_node;
+mod confchange;
 mod config;
 mod errors;
 mod log_unstable;
-mod progress;
+mod quorum;
 #[cfg(test)]
 pub mod raft;
 #[cfg(not(test))]
 mod raft;
 mod raft_log;
 pub mod raw_node;
-pub mod async_raw_node;
 mod read_only;
 mod status;
 pub mod storage;
+mod tracker;
 pub mod util;
 
+pub use self::confchange::{Changer, MapChange};
 pub use self::config::Config;
 pub use self::errors::{Error, Result, StorageError};
 pub use self::log_unstable::Unstable;
-pub use self::progress::inflights::Inflights;
-pub use self::progress::progress_set::{Configuration, ProgressSet};
-pub use self::progress::{Progress, ProgressState};
+pub use self::quorum::joint::Configuration as JointConfig;
+pub use self::quorum::majority::Configuration as MajorityConfig;
 pub use self::raft::{vote_resp_msg_type, Raft, SoftState, StateRole, INVALID_ID, INVALID_INDEX};
 pub use self::raft_log::{RaftLog, NO_LIMIT};
+pub use self::tracker::{Inflights, Progress, ProgressState, ProgressTracker};
 
 #[allow(deprecated)]
 pub use self::raw_node::is_empty_snap;
@@ -526,7 +529,7 @@ pub mod prelude {
 
     pub use crate::raw_node::{Peer, RawNode, Ready, SnapshotStatus};
 
-    pub use crate::progress::Progress;
+    pub use crate::Progress;
 
     pub use crate::status::Status;
 

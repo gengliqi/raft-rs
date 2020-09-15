@@ -18,6 +18,7 @@ use harness::*;
 use raft::eraftpb::*;
 use raft::storage::MemStorage;
 use raft::*;
+use raft_proto::ConfChangeI;
 use slog::Logger;
 
 #[allow(clippy::declare_interior_mutable_const)]
@@ -109,12 +110,19 @@ pub fn new_test_raft_with_config(config: &Config, storage: MemStorage, l: &Logge
     Interface::new(Raft::new(config, storage, l).unwrap())
 }
 
-pub fn hard_state(t: u64, c: u64, v: u64) -> HardState {
+pub fn hard_state(term: u64, commit: u64, vote: u64) -> HardState {
     let mut hs = HardState::default();
-    hs.term = t;
-    hs.commit = c;
-    hs.vote = v;
+    hs.term = term;
+    hs.commit = commit;
+    hs.vote = vote;
     hs
+}
+
+pub fn soft_state(leader_id: u64, raft_state: StateRole) -> SoftState {
+    SoftState {
+        leader_id,
+        raft_state,
+    }
 }
 
 pub const SOME_DATA: Option<&'static str> = Some("somedata");
@@ -162,4 +170,50 @@ pub fn new_snapshot(index: u64, term: u64, voters: Vec<u64>) -> Snapshot {
     s.mut_metadata().term = term;
     s.mut_metadata().mut_conf_state().voters = voters;
     s
+}
+
+fn new_conf_change(ty: ConfChangeType, node_id: u64) -> ConfChange {
+    let mut cc = ConfChange::default();
+    cc.node_id = node_id;
+    cc.set_change_type(ty);
+    cc
+}
+
+pub fn remove_node(node_id: u64) -> ConfChangeV2 {
+    new_conf_change(ConfChangeType::RemoveNode, node_id).into_v2()
+}
+
+pub fn add_node(node_id: u64) -> ConfChangeV2 {
+    new_conf_change(ConfChangeType::AddNode, node_id).into_v2()
+}
+
+pub fn add_learner(node_id: u64) -> ConfChangeV2 {
+    new_conf_change(ConfChangeType::AddLearnerNode, node_id).into_v2()
+}
+
+pub fn conf_state(voters: Vec<u64>, learners: Vec<u64>) -> ConfState {
+    let mut cs = ConfState::default();
+    cs.set_voters(voters);
+    cs.set_learners(learners);
+    cs
+}
+
+pub fn conf_state_v2(
+    voters: Vec<u64>,
+    learners: Vec<u64>,
+    voters_outgoing: Vec<u64>,
+    learners_next: Vec<u64>,
+    auto_leave: bool,
+) -> ConfState {
+    let mut cs = conf_state(voters, learners);
+    cs.set_voters_outgoing(voters_outgoing);
+    cs.set_learners_next(learners_next);
+    cs.auto_leave = auto_leave;
+    cs
+}
+
+pub fn conf_change_v2(steps: Vec<ConfChangeSingle>) -> ConfChangeV2 {
+    let mut cc = ConfChangeV2::default();
+    cc.set_changes(steps.into());
+    cc
 }

@@ -381,7 +381,7 @@ impl<T: Storage> RaftLog<T> {
         self.next_entries_since(self.applied, None)
     }
 
-    /// Returns whether there are entries that can be applied between `since_idx` and the comitted index.
+    /// Returns whether there are entries that can be applied between `since_idx` and the committed index.
     pub fn has_next_entries_since(&self, since_idx: u64, persisted_idx: Option<u64>) -> bool {
         let offset = cmp::max(since_idx + 1, self.first_index());
         let high = match persisted_idx {
@@ -396,6 +396,27 @@ impl<T: Storage> RaftLog<T> {
         self.has_next_entries_since(self.applied, None)
     }
 
+    /// Returns any entries between the a particular index(if none, use applied index) and a committed index.
+    pub fn next_entries_between(
+        &self,
+        since_idx: Option<u64>,
+        committed: u64,
+    ) -> Option<Vec<Entry>> {
+        let since_idx = match since_idx {
+            Some(idx) => idx,
+            None => self.applied,
+        };
+        let offset = cmp::max(since_idx + 1, self.first_index());
+        let high = committed + 1;
+        if high > offset {
+            match self.slice(offset, high, None) {
+                Ok(vec) => return Some(vec),
+                Err(e) => fatal!(self.unstable.logger, "{}", e),
+            }
+        }
+        None
+    }
+
     /// Returns the current snapshot
     pub fn snapshot(&self, request_index: u64) -> Result<Snapshot> {
         if let Some(snap) = self.unstable.snapshot.as_ref() {
@@ -404,6 +425,10 @@ impl<T: Storage> RaftLog<T> {
             }
         }
         self.store.snapshot(request_index)
+    }
+
+    pub(crate) fn pending_snapshot(&self) -> Option<&Snapshot> {
+        self.unstable.snapshot.as_ref()
     }
 
     fn must_check_outofbounds(&self, low: u64, high: u64) -> Option<Error> {

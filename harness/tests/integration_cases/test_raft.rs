@@ -30,20 +30,6 @@ use crate::test_util::*;
 
 type HashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<fxhash::FxHasher>>;
 
-fn new_progress(
-    state: ProgressState,
-    matched: u64,
-    next_idx: u64,
-    pending_snapshot: u64,
-    ins_size: usize,
-) -> Progress {
-    let mut p = Progress::new(next_idx, ins_size);
-    p.state = state;
-    p.matched = matched;
-    p.pending_snapshot = pending_snapshot;
-    p
-}
-
 fn read_messages<T: Storage>(raft: &mut Raft<T>) -> Vec<Message> {
     raft.msgs.drain(..).collect()
 }
@@ -121,94 +107,6 @@ fn next_ents(r: &mut Raft<MemStorage>, s: &MemStorage) -> Vec<Entry> {
     let ents = r.raft_log.next_entries();
     r.commit_apply(r.raft_log.committed);
     ents.unwrap_or_else(Vec::new)
-}
-
-fn do_send_append(raft: &mut Raft<MemStorage>, to: u64) {
-    let mut prs = raft.take_prs();
-    {
-        let pr = prs.get_mut(to).unwrap();
-        raft.send_append(to, pr);
-    }
-    raft.set_prs(prs);
-}
-
-#[test]
-fn test_progress_become_probe() {
-    let matched = 1u64;
-    let mut tests = vec![
-        (
-            new_progress(ProgressState::Replicate, matched, 5, 0, 256),
-            2,
-        ),
-        // snapshot finish
-        (
-            new_progress(ProgressState::Snapshot, matched, 5, 10, 256),
-            11,
-        ),
-        // snapshot failure
-        (new_progress(ProgressState::Snapshot, matched, 5, 0, 256), 2),
-    ];
-    for (i, &mut (ref mut p, wnext)) in tests.iter_mut().enumerate() {
-        p.become_probe();
-        if p.state != ProgressState::Probe {
-            panic!(
-                "#{}: state = {:?}, want {:?}",
-                i,
-                p.state,
-                ProgressState::Probe
-            );
-        }
-        if p.matched != matched {
-            panic!("#{}: match = {:?}, want {:?}", i, p.matched, matched);
-        }
-        if p.next_idx != wnext {
-            panic!("#{}: next = {}, want {}", i, p.next_idx, wnext);
-        }
-    }
-}
-
-#[test]
-fn test_progress_become_replicate() {
-    let mut p = new_progress(ProgressState::Probe, 1, 5, 0, 256);
-    p.become_replicate();
-
-    assert_eq!(p.state, ProgressState::Replicate);
-    assert_eq!(p.matched, 1);
-    assert_eq!(p.matched + 1, p.next_idx);
-}
-
-#[test]
-fn test_progress_become_snapshot() {
-    let mut p = new_progress(ProgressState::Probe, 1, 5, 0, 256);
-    p.become_snapshot(10);
-    assert_eq!(p.state, ProgressState::Snapshot);
-    assert_eq!(p.matched, 1);
-    assert_eq!(p.pending_snapshot, 10);
-}
-
-#[test]
-fn test_progress_update() {
-    let (prev_m, prev_n) = (3u64, 5u64);
-    let tests = vec![
-        (prev_m - 1, prev_m, prev_n, false),
-        (prev_m, prev_m, prev_n, false),
-        (prev_m + 1, prev_m + 1, prev_n, true),
-        (prev_m + 2, prev_m + 2, prev_n + 1, true),
-    ];
-    for (i, &(update, wm, wn, wok)) in tests.iter().enumerate() {
-        let mut p = Progress::new(prev_n, 256);
-        p.matched = prev_m;
-        let ok = p.maybe_update(update);
-        if ok != wok {
-            panic!("#{}: ok= {}, want {}", i, ok, wok);
-        }
-        if p.matched != wm {
-            panic!("#{}: match= {}, want {}", i, p.matched, wm);
-        }
-        if p.next_idx != wn {
-            panic!("#{}: next= {}, want {}", i, p.next_idx, wn);
-        }
-    }
 }
 
 #[test]
@@ -395,77 +293,6 @@ fn test_progress_committed_index() {
         ),
         (10, 10, 10)
     );
-}
-
-#[test]
-fn test_progress_maybe_decr() {
-    let tests = vec![
-        // state replicate and rejected is not greater than match
-        (ProgressState::Replicate, 5, 10, 5, 5, false, 10),
-        // state replicate and rejected is not greater than match
-        (ProgressState::Replicate, 5, 10, 4, 4, false, 10),
-        // state replicate and rejected is greater than match
-        // directly decrease to match+1
-        (ProgressState::Replicate, 5, 10, 9, 9, true, 6),
-        // next-1 != rejected is always false
-        (ProgressState::Probe, 0, 0, 0, 0, false, 0),
-        // next-1 != rejected is always false
-        (ProgressState::Probe, 0, 10, 5, 5, false, 10),
-        // next>1 = decremented by 1
-        (ProgressState::Probe, 0, 10, 9, 9, true, 9),
-        // next>1 = decremented by 1
-        (ProgressState::Probe, 0, 2, 1, 1, true, 1),
-        // next<=1 = reset to 1
-        (ProgressState::Probe, 0, 1, 0, 0, true, 1),
-        // decrease to min(rejected, last+1)
-        (ProgressState::Probe, 0, 10, 9, 2, true, 3),
-        // rejected < 1, reset to 1
-        (ProgressState::Probe, 0, 10, 9, 0, true, 1),
-    ];
-    for (i, &(state, m, n, rejected, last, w, wn)) in tests.iter().enumerate() {
-        let mut p = new_progress(state, m, n, 0, 0);
-        if p.maybe_decr_to(rejected, last, 0) != w {
-            panic!("#{}: maybeDecrTo= {}, want {}", i, !w, w);
-        }
-        if p.matched != m {
-            panic!("#{}: match= {}, want {}", i, p.matched, m);
-        }
-        if p.next_idx != wn {
-            panic!("#{}: next= {}, want {}", i, p.next_idx, wn);
-        }
-    }
-}
-
-#[test]
-fn test_progress_is_paused() {
-    let tests = vec![
-        (ProgressState::Probe, false, false),
-        (ProgressState::Probe, true, true),
-        (ProgressState::Replicate, false, false),
-        (ProgressState::Replicate, true, false),
-        (ProgressState::Snapshot, false, true),
-        (ProgressState::Snapshot, true, true),
-    ];
-    for (i, &(state, paused, w)) in tests.iter().enumerate() {
-        let mut p = new_progress(state, 0, 0, 0, 256);
-        p.paused = paused;
-        if p.is_paused() != w {
-            panic!("#{}: shouldwait = {}, want {}", i, p.is_paused(), w)
-        }
-    }
-}
-
-// test_progress_resume ensures that progress.maybeUpdate and progress.maybeDecrTo
-// will reset progress.paused.
-#[test]
-fn test_progress_resume() {
-    let mut p = Progress::new(2, 256);
-    p.paused = true;
-    p.maybe_decr_to(1, 1, INVALID_INDEX);
-    assert!(!p.paused, "paused= true, want false");
-    p.paused = true;
-    p.maybe_update(2);
-    assert!(!p.paused, "paused= true, want false");
 }
 
 #[test]
@@ -1393,7 +1220,10 @@ fn test_commit() {
         for (j, v) in matches.iter().enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.set_progress(id, *v, *v + 1, false);
+                sm.apply_conf_change(&add_node(id)).unwrap();
+                let pr = sm.mut_prs().get_mut(id).unwrap();
+                pr.matched = *v;
+                pr.next_idx = *v + 1;
             }
         }
         sm.maybe_commit();
@@ -2202,7 +2032,7 @@ fn test_free_stuck_candidate_with_check_quorum() {
 }
 
 #[test]
-fn test_non_promotable_voter_which_check_quorum() {
+fn test_non_promotable_voter_with_check_quorum() {
     let l = default_logger();
     let mut a = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
     let mut b = new_test_raft(2, vec![1], 10, 1, new_storage(), &l);
@@ -2223,7 +2053,11 @@ fn test_non_promotable_voter_which_check_quorum() {
 
     // Need to remove 2 again to make it a non-promotable node since newNetwork
     // overwritten some internal states
-    nt.peers.get_mut(&2).unwrap().mut_prs().remove(2).unwrap();
+    nt.peers
+        .get_mut(&2)
+        .unwrap()
+        .apply_conf_change(&remove_node(2))
+        .unwrap();
 
     assert!(!nt.peers[&2].promotable());
 
@@ -2593,12 +2427,12 @@ fn test_read_only_option_lease() {
             nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
         }
 
-        let e = new_entry(0, 0, Some(wctx));
+        let entry = new_entry(0, 0, Some(wctx));
         nt.send(vec![new_message_with_entries(
             id,
             id,
             MessageType::MsgReadIndex,
-            vec![e],
+            vec![entry],
         )]);
 
         let read_states: Vec<ReadState> = nt
@@ -2639,12 +2473,12 @@ fn test_read_only_option_lease_without_check_quorum() {
     nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
 
     let ctx = "ctx1";
-    let e = new_entry(0, 0, Some(ctx));
+    let entry = new_entry(0, 0, Some(ctx));
     nt.send(vec![new_message_with_entries(
         2,
         2,
         MessageType::MsgReadIndex,
-        vec![e],
+        vec![entry],
     )]);
 
     let read_states = &nt.peers[&2].read_states;
@@ -2998,7 +2832,7 @@ fn test_send_append_for_progress_probe() {
             // loop. After that, the follower is paused until a heartbeat response is
             // received.
             r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            do_send_append(&mut r, 2);
+            r.send_append(2);
             let msg = r.read_messages();
             assert_eq!(msg.len(), 1);
             assert_eq!(msg[0].index, 0);
@@ -3007,7 +2841,7 @@ fn test_send_append_for_progress_probe() {
         assert!(r.prs().get(2).unwrap().paused);
         for _ in 0..10 {
             r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-            do_send_append(&mut r, 2);
+            r.send_append(2);
             assert_eq!(r.read_messages().len(), 0);
         }
 
@@ -3044,7 +2878,7 @@ fn test_send_append_for_progress_replicate() {
 
     for _ in 0..10 {
         r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        do_send_append(&mut r, 2);
+        r.send_append(2);
         assert_eq!(r.read_messages().len(), 1);
     }
 }
@@ -3060,7 +2894,7 @@ fn test_send_append_for_progress_snapshot() {
 
     for _ in 0..10 {
         r.append_entry(&mut [new_entry(0, 0, SOME_DATA)]);
-        do_send_append(&mut r, 2);
+        r.send_append(2);
         assert_eq!(r.read_messages().len(), 0);
     }
 }
@@ -3101,14 +2935,11 @@ fn test_restore() {
         sm.raft_log.term(s.get_metadata().index).unwrap(),
         s.get_metadata().term
     );
-    assert_eq!(
-        sm.prs().voter_ids(),
+    assert_iter_eq!(
+        o sm.prs().conf().voters().ids(),
         s.get_metadata()
             .get_conf_state()
             .voters
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>(),
     );
     assert!(!sm.restore(s));
 }
@@ -3314,10 +3145,9 @@ fn test_new_leader_pending_config() {
 fn test_add_node() -> Result<()> {
     let l = default_logger();
     let mut r = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    r.add_node(2)?;
-    assert_eq!(
-        r.prs().voter_ids(),
-        vec![1, 2].into_iter().collect::<HashSet<_>>()
+    r.apply_conf_change(&add_node(2))?;
+    assert_iter_eq!(o r.prs().conf().voters().ids(),
+        vec![1, 2]
     );
 
     Ok(())
@@ -3337,7 +3167,7 @@ fn test_add_node_check_quorum() -> Result<()> {
         r.tick();
     }
 
-    r.add_node(2)?;
+    r.apply_conf_change(&add_node(2))?;
 
     // This tick will reach electionTimeout, which triggers a quorum check.
     r.tick();
@@ -3362,22 +3192,24 @@ fn test_add_node_check_quorum() -> Result<()> {
 fn test_remove_node() -> Result<()> {
     let l = default_logger();
     let mut r = new_test_raft(1, vec![1, 2], 10, 1, new_storage(), &l);
-    r.remove_node(2)?;
-    assert_eq!(r.prs().voter_ids().iter().next().unwrap(), &1);
-    // remove all nodes from cluster
-    r.remove_node(1)?;
-    assert!(r.prs().voter_ids().is_empty());
+    r.apply_conf_change(&remove_node(2))?;
+    assert_iter_eq!(o r.prs().conf().voters().ids(), vec![1]);
+
+    // Removing all voters is not allowed.
+    assert!(r.apply_conf_change(&remove_node(1)).is_err());
+    assert_iter_eq!(o r.prs().conf().voters().ids(), vec![1]);
 
     Ok(())
 }
 
 #[test]
 fn test_remove_node_itself() -> Result<()> {
-    let l = default_logger().new(o!("test" => "remove_node_itself"));
+    let l = default_logger();
     let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n1.remove_node(1)?;
-    assert_eq!(n1.prs().learner_ids().iter().next().unwrap(), &2);
-    assert!(n1.prs().voter_ids().is_empty());
+
+    assert!(n1.apply_conf_change(&remove_node(1)).is_err());
+    assert_iter_eq!(n1.prs().conf().learners(), vec![2]);
+    assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
     Ok(())
 }
 
@@ -3408,7 +3240,7 @@ fn test_raft_nodes() {
     ];
     for (i, (ids, wids)) in tests.drain(..).enumerate() {
         let r = new_test_raft(1, ids, 10, 1, new_storage(), &l);
-        let voter_ids = r.prs().voter_ids();
+        let voter_ids: HashSet<_> = r.prs().conf().voters().ids().iter().collect();
         let wids = wids.into_iter().collect::<HashSet<_>>();
         if voter_ids != wids {
             panic!("#{}: nodes = {:?}, want {:?}", i, voter_ids, wids);
@@ -3453,31 +3285,31 @@ fn test_commit_after_remove_node() -> Result<()> {
     r.become_leader();
 
     // Begin to remove the second node.
-    let mut m = new_message(0, 0, MessageType::MsgPropose, 0);
-    let mut e = Entry::default();
-    e.set_entry_type(EntryType::EntryConfChange);
+    let mut msg = new_message(0, 0, MessageType::MsgPropose, 0);
+    let mut entry = Entry::default();
+    entry.set_entry_type(EntryType::EntryConfChange);
     let mut cc = ConfChange::default();
     cc.set_change_type(ConfChangeType::RemoveNode);
     cc.node_id = 2;
     let ccdata = cc.write_to_bytes().unwrap();
-    e.data = ccdata;
-    m.mut_entries().push(e);
-    r.step(m).expect("");
+    entry.data = ccdata;
+    msg.mut_entries().push(entry);
+    r.step(msg).expect("");
     // Stabilize the log and make sure nothing is committed yet.
     assert_eq!(next_ents(&mut r, &s).len(), 0);
     let cc_index = r.raft_log.last_index();
 
     // While the config change is pending, make another proposal.
-    let mut m = new_message(0, 0, MessageType::MsgPropose, 0);
-    let mut e = new_entry(0, 0, Some("hello"));
-    e.set_entry_type(EntryType::EntryNormal);
-    m.mut_entries().push(e);
-    r.step(m).expect("");
+    let mut msg = new_message(0, 0, MessageType::MsgPropose, 0);
+    let mut entry = new_entry(0, 0, Some("hello"));
+    entry.set_entry_type(EntryType::EntryNormal);
+    msg.mut_entries().push(entry);
+    r.step(msg).expect("");
 
     // Node 2 acknowledges the config change, committing it.
-    let mut m = new_message(2, 0, MessageType::MsgAppendResponse, 0);
-    m.index = cc_index;
-    r.step(m).expect("");
+    let mut msg = new_message(2, 0, MessageType::MsgAppendResponse, 0);
+    msg.index = cc_index;
+    r.step(msg).expect("");
     let ents = next_ents(&mut r, &s);
     assert_eq!(ents.len(), 2);
     assert_eq!(ents[0].get_entry_type(), EntryType::EntryNormal);
@@ -3486,7 +3318,7 @@ fn test_commit_after_remove_node() -> Result<()> {
 
     // Apply the config change. This reduces quorum requirements so the
     // pending command can now commit.
-    r.remove_node(2)?;
+    r.apply_conf_change(&remove_node(2))?;
     let ents = next_ents(&mut r, &s);
     assert_eq!(ents.len(), 1);
     assert_eq!(ents[0].get_entry_type(), EntryType::EntryNormal);
@@ -3754,7 +3586,10 @@ fn test_leader_transfer_remove_node() -> Result<()> {
     nt.send(vec![new_message(3, 1, MessageType::MsgTransferLeader, 0)]);
     assert_eq!(nt.peers[&1].lead_transferee.unwrap(), 3);
 
-    nt.peers.get_mut(&1).unwrap().remove_node(3)?;
+    nt.peers
+        .get_mut(&1)
+        .unwrap()
+        .apply_conf_change(&remove_node(3))?;
 
     check_leader_transfer_state(&nt.peers[&1], StateRole::Leader, 1);
 
@@ -3993,8 +3828,16 @@ fn test_learner_promotion() -> Result<()> {
     network.send(vec![heart_beat.clone()]);
 
     // Promote n2 from learner to follower.
-    network.peers.get_mut(&1).unwrap().add_node(2)?;
-    network.peers.get_mut(&2).unwrap().add_node(2)?;
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .apply_conf_change(&add_node(2))?;
+    network
+        .peers
+        .get_mut(&2)
+        .unwrap()
+        .apply_conf_change(&add_node(2))?;
     assert_eq!(network.peers[&2].state, StateRole::Follower);
     assert!(network.peers[&2].promotable());
 
@@ -4085,34 +3928,33 @@ fn test_restore_with_learner() {
     assert!(sm.restore(s.clone()));
     assert_eq!(sm.raft_log.last_index(), 11);
     assert_eq!(sm.raft_log.term(11).unwrap(), 11);
-    assert_eq!(sm.prs().voters().count(), 2);
-    assert_eq!(sm.prs().learners().count(), 1);
+    assert_iter_eq!(o sm.prs().conf().voters().ids(), vec![1, 2]);
+    assert_iter_eq!(sm.prs().conf().learners(), vec![3]);
 
     let conf_state = s.get_metadata().get_conf_state();
-    for &node in &conf_state.voters {
-        assert!(sm.prs().get(node).is_some());
-        assert!(!sm.prs().learner_ids().contains(&node));
+    for node in &conf_state.voters {
+        assert!(sm.prs().get(*node).is_some());
+        assert!(!sm.prs().conf().learners().contains(node));
     }
 
-    for &node in &conf_state.learners {
-        assert!(sm.prs().get(node).is_some());
-        assert!(sm.prs().learner_ids().contains(&node));
+    for node in &conf_state.learners {
+        assert!(sm.prs().get(*node).is_some());
+        assert!(sm.prs().conf().learners().contains(node));
     }
 
     assert!(!sm.restore(s));
 }
 
-// TestRestoreInvalidLearner verfies that a normal peer can't become learner again
-// when restores snapshot.
+// Verfies that a voter can be depromoted by snapshot.
 #[test]
-fn test_restore_invalid_learner() {
+fn test_restore_depromote_voter() {
     let l = default_logger();
     let mut s = new_snapshot(11, 11, vec![1, 2]);
     s.mut_metadata().mut_conf_state().mut_learners().push(3);
 
     let mut sm = new_test_raft(3, vec![1, 2, 3], 10, 1, new_storage(), &l);
     assert!(sm.promotable());
-    assert!(!sm.restore(s));
+    assert!(sm.restore(s));
 }
 
 #[test]
@@ -4182,29 +4024,10 @@ fn test_learner_receive_snapshot() {
 fn test_add_learner() -> Result<()> {
     let l = default_logger();
     let mut n1 = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    n1.add_learner(2)?;
+    n1.apply_conf_change(&add_learner(2))?;
 
-    assert_eq!(*n1.prs().learner_ids().iter().next().unwrap(), 2);
-    assert!(n1.prs().learner_ids().contains(&2));
-
-    Ok(())
-}
-
-// Ensure when add_voter is called on a peers own ID that it will be promoted.
-// When the action fails, ensure it doesn't mutate the raft state.
-#[test]
-fn test_add_voter_peer_promotes_self_sets_is_learner() -> Result<()> {
-    let l = default_logger();
-
-    let mut n1 = new_test_raft(1, vec![1], 10, 1, new_storage(), &l);
-    // Node is already voter.
-    n1.add_learner(1).ok();
-    assert!(n1.promotable());
-    assert!(n1.prs().voter_ids().contains(&1));
-    n1.remove_node(1)?;
-    n1.add_learner(1)?;
-    assert!(!n1.promotable());
-    assert!(n1.prs().learner_ids().contains(&1));
+    assert_iter_eq!(n1.prs().conf().learners(), vec![2]);
+    assert!(n1.prs().conf().learners().contains(&2));
 
     Ok(())
 }
@@ -4215,13 +4038,14 @@ fn test_add_voter_peer_promotes_self_sets_is_learner() -> Result<()> {
 fn test_remove_learner() -> Result<()> {
     let l = default_logger();
     let mut n1 = new_test_learner_raft(1, vec![1], vec![2], 10, 1, new_storage(), &l);
-    n1.remove_node(2)?;
-    assert_eq!(n1.prs().voter_ids().iter().next().unwrap(), &1);
-    assert!(n1.prs().learner_ids().is_empty());
+    n1.apply_conf_change(&remove_node(2))?;
+    assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
+    assert!(n1.prs().conf().learners().is_empty());
 
-    n1.remove_node(1)?;
-    assert!(n1.prs().voter_ids().is_empty());
-    assert_eq!(n1.prs().learner_ids().len(), 0);
+    // Remove all voters are not allowed.
+    assert!(n1.apply_conf_change(&remove_node(1)).is_err());
+    assert_iter_eq!(o n1.prs().conf().voters().ids(), vec![1]);
+    assert!(n1.prs().conf().learners().is_empty());
 
     Ok(())
 }
@@ -4360,7 +4184,11 @@ fn test_learner_respond_vote() -> Result<()> {
     assert_eq!(network.peers[&1].state, StateRole::Candidate);
 
     // After promote 3 to voter, election should success.
-    network.peers.get_mut(&1).unwrap().add_node(3)?;
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .apply_conf_change(&add_node(3))?;
     do_campaign(&mut network);
     assert_eq!(network.peers[&1].state, StateRole::Leader);
 
@@ -4598,7 +4426,11 @@ fn test_conf_change_check_before_campaign() {
 
     let committed = nt.peers[&2].raft_log.committed;
     nt.peers.get_mut(&2).unwrap().commit_apply(committed);
-    nt.peers.get_mut(&2).unwrap().remove_node(3).unwrap();
+    nt.peers
+        .get_mut(&2)
+        .unwrap()
+        .apply_conf_change(&remove_node(3))
+        .unwrap();
 
     // transfer leadership to peer 2 again.
     nt.send(vec![new_message(2, 1, MessageType::MsgTransferLeader, 0)]);
@@ -4606,7 +4438,11 @@ fn test_conf_change_check_before_campaign() {
     assert_eq!(nt.peers[&2].state, StateRole::Leader);
 
     nt.peers.get_mut(&1).unwrap().commit_apply(committed);
-    nt.peers.get_mut(&1).unwrap().remove_node(3).unwrap();
+    nt.peers
+        .get_mut(&1)
+        .unwrap()
+        .apply_conf_change(&remove_node(3))
+        .unwrap();
 
     // trigger campaign in node 1
     nt.peers
@@ -4953,7 +4789,10 @@ fn test_group_commit() {
         for (j, (m, g)) in matches.into_iter().zip(group_ids).enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.set_progress(id, m, m + 1, false);
+                sm.apply_conf_change(&add_node(id)).unwrap();
+                let pr = sm.mut_prs().get_mut(id).unwrap();
+                pr.matched = m;
+                pr.next_idx = m + 1;
             }
             if g != 0 {
                 groups.push((id, g));
@@ -5082,7 +4921,10 @@ fn test_group_commit_consistent() {
         for (j, (m, g)) in matches.into_iter().zip(group_ids).enumerate() {
             let id = j as u64 + 1;
             if sm.mut_prs().get(id).is_none() {
-                sm.set_progress(id, m, m + 1, false);
+                sm.apply_conf_change(&add_node(id)).unwrap();
+                let pr = sm.mut_prs().get_mut(id).unwrap();
+                pr.matched = m;
+                pr.next_idx = m + 1;
             }
             if g != 0 {
                 groups.push((id, g));
@@ -5225,6 +5067,11 @@ fn test_read_when_quorum_becomes_less() {
     let heartbeat_responses = network.read_messages();
     assert_eq!(heartbeat_responses.len(), 1);
 
-    network.peers.get_mut(&1).unwrap().remove_node(2).unwrap();
+    network
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .apply_conf_change(&remove_node(2))
+        .unwrap();
     assert!(!network.peers[&1].read_states.is_empty());
 }

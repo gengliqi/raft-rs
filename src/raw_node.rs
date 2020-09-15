@@ -26,15 +26,13 @@ use std::{
 };
 
 use protobuf::Message as PbMessage;
+use raft_proto::ConfChangeI;
 
 use crate::config::Config;
-use crate::eraftpb::{
-    ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Message, MessageType,
-    Snapshot,
-};
+use crate::eraftpb::{ConfState, Entry, EntryType, HardState, Message, MessageType, Snapshot};
 use crate::errors::{Error, Result};
 use crate::read_only::ReadState;
-use crate::{Raft, SoftState, Status, Storage, INVALID_ID};
+use crate::{Raft, SoftState, Status, Storage};
 use slog::Logger;
 
 /// Represents a Peer node in the cluster.
@@ -56,7 +54,8 @@ pub enum SnapshotStatus {
     Failure,
 }
 
-fn is_local_msg(t: MessageType) -> bool {
+/// Checks if certain message type should be used internally.
+pub fn is_local_msg(t: MessageType) -> bool {
     match t {
         MessageType::MsgHup
         | MessageType::MsgBeat
@@ -140,35 +139,32 @@ impl<T: Storage> RawNodeRaft<T> {
     }
 
     /// ProposeConfChange proposes a config change.
+    ///
+    /// If the node enters joint state with `auto_leave` set to true, it's
+    /// caller's responsibility to propose an empty conf change again to force
+    /// leaving joint state.
     #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_pass_by_value))]
-    pub fn propose_conf_change(&mut self, context: Vec<u8>, cc: ConfChange) -> Result<()> {
-        let data = cc.write_to_bytes()?;
+    pub fn propose_conf_change(&mut self, context: Vec<u8>, cc: impl ConfChangeI) -> Result<()> {
+        let (data, ty) = if let Some(cc) = cc.as_v1() {
+            (cc.write_to_bytes()?, EntryType::EntryConfChange)
+        } else {
+            (cc.as_v2().write_to_bytes()?, EntryType::EntryConfChangeV2)
+        };
         let mut m = Message::default();
         m.set_msg_type(MessageType::MsgPropose);
         let mut e = Entry::default();
-        e.set_entry_type(EntryType::EntryConfChange);
+        e.set_entry_type(ty);
         e.data = data;
         e.context = context;
         m.set_entries(vec![e].into());
         self.raft.step(m)
     }
 
-    /// Takes the conf change and applies it.
-    pub fn apply_conf_change(&mut self, cc: &ConfChange) -> Result<ConfState> {
-        if cc.node_id == INVALID_ID {
-            let mut cs = ConfState::default();
-            cs.voters = self.raft.prs().voter_ids().iter().cloned().collect();
-            cs.learners = self.raft.prs().learner_ids().iter().cloned().collect();
-            return Ok(cs);
-        }
-        let nid = cc.node_id;
-        match cc.get_change_type() {
-            ConfChangeType::AddNode => self.raft.add_node(nid)?,
-            ConfChangeType::AddLearnerNode => self.raft.add_learner(nid)?,
-            ConfChangeType::RemoveNode => self.raft.remove_node(nid)?,
-        };
-
-        Ok(self.raft.prs().configuration().to_conf_state())
+    /// Applies a config change to the local node. The app must call this when it
+    /// applies a configuration change, except when it decides to reject the
+    /// configuration change, in which case no call must take place.
+    pub fn apply_conf_change(&mut self, cc: &impl ConfChangeI) -> Result<ConfState> {
+        self.raft.apply_conf_change(&cc.as_v2())
     }
 
     /// Step advances the state machine using the given message.
@@ -313,22 +309,26 @@ impl Ready {
         if &ss != prev_ss {
             rd.ss = Some(ss);
         }
-        // TODO: Just for Singleton, maybe we can special judge it?
-        let hs = raft.hard_state_for_ready();
+        let mut hs = raft.hard_state();
+        if raft.prs().is_singleton() && !rd.entries.is_empty() {
+            hs.commit = rd.entries.last().unwrap().index;
+        }
         if &hs != prev_hs {
-            if hs.vote != prev_hs.vote || hs.term != prev_hs.term {
+            if hs.vote != prev_hs.vote || hs.term != prev_hs.term || !rd.entries.is_empty() {
                 rd.must_sync = true;
             }
             rd.hs = Some(hs);
         }
-        // TODO: Just for Singleton, should use the hs.commit
-        rd.committed_entries = Some(
-            (match since_idx {
+        if raft.prs().is_singleton() && rd.hs.is_some() {
+            rd.committed_entries = raft
+                .raft_log
+                .next_entries_between(since_idx, rd.hs.as_ref().unwrap().commit);
+        } else {
+            rd.committed_entries = match since_idx {
                 None => raft.raft_log.next_entries(),
                 Some(since_idx) => raft.raft_log.next_entries_since(since_idx, None),
-            })
-            .unwrap_or_else(Vec::new),
-        );
+            };
+        }
         if raft.raft_log.unstable.snapshot.is_some() {
             rd.snapshot = raft.raft_log.unstable.snapshot.clone().unwrap();
         }
@@ -500,7 +500,7 @@ impl<T: Storage> RawNode<T> {
         if raft.soft_state() != self.prev_ss {
             return true;
         }
-        let hs = raft.hard_state_for_ready();
+        let hs = raft.hard_state();
         if hs != HardState::default() && hs != self.prev_hs {
             return true;
         }
