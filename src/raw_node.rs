@@ -389,7 +389,7 @@ impl Ready {
 /// more fully there.
 pub struct RawNode<T: Storage> {
     /// The internal raft state.
-    core: RawNodeRaft<T>,
+    pub core: RawNodeRaft<T>,
     prev_ss: SoftState,
     prev_hs: HardState,
 }
