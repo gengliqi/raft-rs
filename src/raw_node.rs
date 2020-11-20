@@ -379,8 +379,27 @@ impl<T: Storage> RawNode<T> {
         Err(Error::StepPeerNotFound)
     }
 
+    fn flush_ready_records(&mut self) {
+        if self.prev_ss.raft_state != StateRole::Leader && self.raft.state == StateRole::Leader {
+            // The vote msg which makes this peer become leader has been sent after persisting.
+            // So the remain records must be generated during being candidate which can not
+            // have last_log and snapshot(if so, it should become to follower). The only things
+            // left are messages and they can be sent without persisting because no key data
+            // changes (term, vote, entry). These messages should be added before raft.msgs to
+            // avoid out of order.
+            for record in self.records.drain(..) {
+                assert_eq!(record.last_entry, None);
+                assert!(!record.has_snapshot);
+                if !record.messages.is_empty() {
+                    self.messages.push(record.messages);
+                }
+            }
+        }
+    }
+
     /// Fetches a `LightReady`.
     pub fn light_ready(&mut self) -> LightReady {
+        self.flush_ready_records();
         let mut rd = LightReady::default();
         let raft = &mut self.raft;
         rd.committed_entries = raft
@@ -412,6 +431,7 @@ impl<T: Storage> RawNode<T> {
 
     /// Ready returns the current point-in-time state of this RawNode.
     pub fn ready(&mut self) -> Ready {
+        self.flush_ready_records();
         let raft = &mut self.raft;
 
         self.max_number += 1;
@@ -423,22 +443,6 @@ impl<T: Storage> RawNode<T> {
             number: self.max_number,
             ..Default::default()
         };
-
-        if self.prev_ss.raft_state != StateRole::Leader && raft.state == StateRole::Leader {
-            // The vote msg which makes this peer become leader has been sent after persisting.
-            // So the remain records must be generated during being candidate which can not
-            // have last_log and snapshot(if so, it should become to follower). The only things
-            // left are messages and they can be sent without persisting because no key data
-            // changes (term, vote, entry). These messages should be added before raft.msgs to
-            // avoid out of order.
-            for record in self.records.drain(..) {
-                assert_eq!(record.last_entry, None);
-                assert!(!record.has_snapshot);
-                if !record.messages.is_empty() {
-                    self.messages.push(record.messages);
-                }
-            }
-        }
 
         let ss = raft.soft_state();
         if ss != self.prev_ss {
@@ -483,9 +487,9 @@ impl<T: Storage> RawNode<T> {
         if !raft.msgs.is_empty() && raft.state != StateRole::Leader {
             mem::swap(&mut rd_record.messages, &mut raft.msgs);
         }
-        self.records.push_back(rd_record);
 
         rd.light = self.light_ready();
+        self.records.push_back(rd_record);
         rd
     }
 
