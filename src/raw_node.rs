@@ -400,6 +400,18 @@ impl<T: Storage> RawNode<T> {
     /// Fetches a `LightReady`.
     pub fn light_ready(&mut self) -> LightReady {
         self.flush_ready_records();
+        let mut rd = self.gen_light_ready();
+        if let Some(e) = rd.committed_entries.last() {
+            if e.get_index() > self.prev_hs.commit {
+                rd.commit_index = Some(e.get_index());
+                // Commit index change is advertised by last line.
+                self.prev_hs.commit = e.get_index();
+            }
+        }
+        rd
+    }
+
+    fn gen_light_ready(&mut self) -> LightReady {
         let mut rd = LightReady::default();
         let raft = &mut self.raft;
         rd.committed_entries = raft
@@ -411,11 +423,6 @@ impl<T: Storage> RawNode<T> {
         if let Some(e) = rd.committed_entries.last() {
             assert!(self.commit_since_index < e.get_index());
             self.commit_since_index = e.get_index();
-            if e.get_index() > self.prev_hs.commit {
-                rd.commit_index = Some(e.get_index());
-                // Commit index change is advertised by last line.
-                self.prev_hs.commit = e.get_index();
-            }
         }
 
         if !self.messages.is_empty() {
@@ -488,7 +495,7 @@ impl<T: Storage> RawNode<T> {
             mem::swap(&mut rd_record.messages, &mut raft.msgs);
         }
 
-        rd.light = self.light_ready();
+        rd.light = self.gen_light_ready();
         self.records.push_back(rd_record);
         rd
     }
