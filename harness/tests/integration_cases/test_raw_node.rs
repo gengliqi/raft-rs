@@ -958,7 +958,7 @@ fn test_raw_node_entries_after_snapshot() {
     assert_eq!(light_rd.committed_entries().as_slice(), &entries[..2]);
     // Should have a MsgAppendResponse
     assert_eq!(
-        light_rd.messages()[0][0].get_msg_type(),
+        light_rd.messages()[0].get_msg_type(),
         MessageType::MsgAppendResponse
     );
 }
@@ -1091,10 +1091,8 @@ fn test_async_ready_leader() {
         );
         // Leader‘s msg can be sent immediately.
         must_cmp_ready(&rd, &None, &None, &entries, &[], &None, false, true);
-        for vec_msg in rd.take_messages() {
-            for msg in vec_msg {
-                assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
-            }
+        for msg in rd.take_messages() {
+            assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
         }
 
         s.wl().append(&entries).unwrap();
@@ -1169,10 +1167,8 @@ fn test_async_ready_leader() {
     assert_eq!(entries.last().unwrap().get_index(), first_index + 10);
     // Leader‘s msg can be sent immediately.
     must_cmp_ready(&rd, &None, &None, &entries, &[], &None, false, true);
-    for vec_msg in rd.take_messages() {
-        for msg in vec_msg {
-            assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
-        }
+    for msg in rd.take_messages() {
+        assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
     }
     s.wl().append(&entries).unwrap();
     raw_node.advance_append_async(rd);
@@ -1201,11 +1197,9 @@ fn test_async_ready_leader() {
         false,
         false,
     );
-    for vec_msg in rd.take_messages() {
-        for msg in vec_msg {
-            assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
-            assert_eq!(msg.get_commit(), first_index + 9);
-        }
+    for msg in rd.take_messages() {
+        assert_eq!(msg.get_msg_type(), MessageType::MsgAppend);
+        assert_eq!(msg.get_commit(), first_index + 9);
     }
 
     // Forward commit index due to peer 1's append response and persisted entries
@@ -1277,14 +1271,10 @@ fn test_async_ready_follower() {
             rd.committed_entries().last().unwrap().get_index(),
             first_index + 3 * 3 + 3
         );
-        let mut msg_num = 0;
-        for vec_msg in rd.take_messages() {
-            for msg in vec_msg {
-                assert_eq!(msg.get_msg_type(), MessageType::MsgAppendResponse);
-                msg_num += 1;
-            }
+        assert_eq!(rd.messages().len(), 4);
+        for msg in rd.take_messages() {
+            assert_eq!(msg.get_msg_type(), MessageType::MsgAppendResponse);
         }
-        assert_eq!(msg_num, 4);
 
         let mut light_rd = raw_node.advance_append(rd);
         assert_eq!(light_rd.commit_index(), None);
@@ -1296,14 +1286,10 @@ fn test_async_ready_follower() {
             light_rd.committed_entries().last().unwrap().get_index(),
             first_index + 10 * 3
         );
-        let mut msg_num = 0;
-        for vec_msg in light_rd.take_messages() {
-            for msg in vec_msg {
-                assert_eq!(msg.get_msg_type(), MessageType::MsgAppendResponse);
-                msg_num += 1;
-            }
+        assert_eq!(light_rd.messages().len(), 6);
+        for msg in light_rd.take_messages() {
+            assert_eq!(msg.get_msg_type(), MessageType::MsgAppendResponse);
         }
-        assert_eq!(msg_num, 6);
 
         first_index += 10 * 3;
         rd_number += 11;
@@ -1393,17 +1379,16 @@ fn test_async_ready_become_leader() {
         &[],
         &[],
         &None,
-        true,
+        false,
         true,
     );
     s.wl().set_hardstate(rd.hs().unwrap().clone());
 
-    let mut light_rd = raw_node.advance_append(rd);
-    for vec_msg in light_rd.take_messages() {
-        for msg in vec_msg {
-            assert_eq!(msg.get_msg_type(), MessageType::MsgRequestVote);
-        }
+    for msg in rd.messages() {
+        assert_eq!(msg.get_msg_type(), MessageType::MsgRequestVote);
     }
+
+    let _ = raw_node.advance_append(rd);
 
     // Peer 1 should reject to vote to peer 2
     let mut vote_request_2 = new_message(2, 1, MessageType::MsgRequestVote, 0);
@@ -1449,18 +1434,14 @@ fn test_async_ready_become_leader() {
         true,
     );
     // 2 vote reject + 2 append entries
-    let mut count = 0;
-    for vec_msg in rd.take_messages() {
-        for msg in vec_msg {
-            let msg_type = match count {
-                0 | 1 => MessageType::MsgRequestVoteResponse,
-                _ => MessageType::MsgAppend,
-            };
-            assert_eq!(msg.get_msg_type(), msg_type);
-            count += 1;
-        }
+    assert_eq!(rd.messages().len(), 4);
+    for (i, msg) in rd.take_messages().iter().enumerate() {
+        let msg_type = match i {
+            0 | 1 => MessageType::MsgRequestVoteResponse,
+            _ => MessageType::MsgAppend,
+        };
+        assert_eq!(msg.get_msg_type(), msg_type);
     }
-    assert_eq!(count, 4);
 
     s.wl().append(rd.entries()).unwrap();
 
