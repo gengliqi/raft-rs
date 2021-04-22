@@ -94,6 +94,8 @@ pub struct Ready {
 
     entries: Vec<Entry>,
 
+    entries_size: usize,
+
     snapshot: Snapshot,
 
     light: LightReady,
@@ -140,6 +142,12 @@ impl Ready {
     #[inline]
     pub fn entries(&self) -> &Vec<Entry> {
         &self.entries
+    }
+
+    /// EntriesSize specifies the size of entries to be saved to stable storage.
+    #[inline]
+    pub fn entries_size(&self) -> usize {
+        self.entries_size
     }
 
     /// Take the Entries.
@@ -470,6 +478,7 @@ impl<T: Storage> RawNode<T> {
         }
 
         rd.entries = raft.raft_log.unstable_entries().to_vec();
+        rd.entries_size = raft.raft_log.unstable().entries_size;
         if let Some(e) = rd.entries.last() {
             // If the last entry exists, the entries must not empty, vice versa.
             rd.must_sync = true;
