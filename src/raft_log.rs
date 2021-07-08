@@ -310,14 +310,13 @@ impl<T: Storage> RaftLog<T> {
         if idx == 0 {
             return;
         }
-        if idx > cmp::min(self.committed, self.persisted) || idx < self.applied {
+        if idx > self.committed || idx < self.applied {
             fatal!(
                 self.unstable.logger,
-                "applied({}) is out of range [prev_applied({}), min(committed({}), persisted({}))]",
+                "applied({}) is out of range [prev_applied({}), committed({})]",
                 idx,
                 self.applied,
                 self.committed,
-                self.persisted,
             )
         }
         self.applied = idx;
