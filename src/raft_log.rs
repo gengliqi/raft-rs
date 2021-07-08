@@ -416,7 +416,8 @@ impl<T: Storage> RaftLog<T> {
     /// Returns committed and persisted entries since max(`since_idx` + 1, first_index).
     pub fn next_entries_since(&self, since_idx: u64, max_size: Option<u64>) -> Option<Vec<Entry>> {
         let offset = cmp::max(since_idx + 1, self.first_index());
-        let high = cmp::min(self.committed, self.persisted) + 1;
+        //let high = cmp::min(self.committed, self.persisted) + 1;
+        let high = self.committed + 1;
         if high > offset {
             match self.slice(offset, high, max_size) {
                 Ok(vec) => return Some(vec),
