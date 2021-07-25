@@ -32,7 +32,7 @@ use crate::read_only::ReadState;
 use crate::{config::Config, StateRole};
 use crate::{Raft, SoftState, Status, Storage};
 
-use slog::info;
+use slog::{info, error};
 
 /// Represents a Peer node in the cluster.
 #[derive(Debug, Default)]
@@ -419,6 +419,12 @@ impl<T: Storage> RawNode<T> {
             .raft_log
             .next_entries_since(self.commit_since_index, max_size)
             .unwrap_or_default();
+        if let Some(e) = rd.committed_entries.first() {
+            if e.get_index() != self.commit_since_index + 1 {
+                error!(raft.logger, "index not match, {} != commit_since_index {} + 1, first index {}", e.get_index(),
+                        self.commit_since_index, raft.raft_log.first_index());
+            }
+        }
         // Update raft uncommitted entries size
         raft.reduce_uncommitted_size(&rd.committed_entries);
         if let Some(e) = rd.committed_entries.last() {
