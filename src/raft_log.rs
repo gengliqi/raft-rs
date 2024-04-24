@@ -42,7 +42,7 @@ pub struct RaftLog<T: Storage> {
     /// The highest log position that is known to be in stable storage
     /// on a quorum of nodes.
     ///
-    /// Invariant: applied <= committed
+    /// Invariant: applied <= committed.
     /// NOTE: this invariant can be break after restart if max_apply_unpersisted_log_limit > 0,
     /// but once the committed catches up with applied, it should never fall behind again.
     pub committed: u64,
@@ -51,7 +51,7 @@ pub struct RaftLog<T: Storage> {
     /// storage. It's used for limiting the upper bound of committed and
     /// persisted entries.
     ///
-    /// Invariant: persisted < unstable.offset
+    /// Invariant: persisted < unstable.offset.
     pub persisted: u64,
 
     /// The highest log position that the application has been instructed
@@ -282,6 +282,30 @@ impl<T: Storage> RaftLog<T> {
                 if self.persisted > conflict_idx - 1 {
                     self.persisted = conflict_idx - 1;
                 }
+
+                if self.applied > self.committed {
+                    let prev_start_term = if start == 0 {
+                        term
+                    } else {
+                        ents[start - 1].term
+                    };
+                    for e in &ents[start..] {
+                        if e.index > self.applied {
+                            break;
+                        }
+                        if e.term != prev_start_term {
+                            fatal!(
+                                self.unstable.logger,
+                                "append entry {}'s term {} is not equal to {} when applied {} > committed {}",
+                                e.index,
+                                e.term,
+                                prev_start_term,
+                                self.applied,
+                                self.committed
+                            )
+                        }
+                    }
+                }
             }
             let last_new_index = idx + ents.len() as u64;
             self.commit_to(cmp::min(committed, last_new_index));
@@ -440,7 +464,7 @@ impl<T: Storage> RaftLog<T> {
     /// Returns committed and persisted entries since max(`since_idx` + 1, first_index).
     pub fn next_entries_since(&self, since_idx: u64, max_size: Option<u64>) -> Option<Vec<Entry>> {
         let offset = cmp::max(since_idx + 1, self.first_index());
-        let high = self.applied_index_upper_bound() + 1;
+        let high = self.next_applied_index_upper_bound() + 1;
         if high > offset {
             match self.slice(
                 offset,
@@ -456,11 +480,42 @@ impl<T: Storage> RaftLog<T> {
     }
 
     #[inline]
-    fn applied_index_upper_bound(&self) -> u64 {
-        std::cmp::min(
-            self.committed,
-            self.persisted + self.max_apply_unpersisted_log_limit,
-        )
+    fn next_applied_index_upper_bound(&self) -> u64 {
+        if self.persisted >= self.committed {
+            return self.committed;
+        }
+        if self.max_apply_unpersisted_log_limit == 0 {
+            return self.persisted;
+        }
+        
+        let commit_term = match self.term(self.committed) {
+            Ok(t) => t,
+            Err(e) => fatal!(
+                self.unstable.logger,
+                "last committed entry at {} is missing: {:?}",
+                self.committed,
+                e
+            ),
+        };
+        let persist_term = match self.term(self.persisted) {
+            Ok(t) => t,
+            Err(e) => fatal!(
+                self.unstable.logger,
+                "last persisted entry at {} is missing: {:?}",
+                self.persisted,
+                e
+            ),
+        };
+
+        if commit_term == persist_term {
+            std::cmp::min(
+                self.committed,
+                self.persisted + self.max_apply_unpersisted_log_limit,
+            )
+        }
+        else {
+            self.persisted 
+        }
     }
 
     /// Returns all the available entries for execution.
@@ -474,7 +529,7 @@ impl<T: Storage> RaftLog<T> {
     /// max(`since_idx` + 1, first_index).
     pub fn has_next_entries_since(&self, since_idx: u64) -> bool {
         let offset = cmp::max(since_idx + 1, self.first_index());
-        let high = self.applied_index_upper_bound() + 1;
+        let high = self.next_applied_index_upper_bound() + 1;
         high > offset
     }
 
