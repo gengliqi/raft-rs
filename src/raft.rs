@@ -2146,6 +2146,10 @@ impl<T: Storage> Raft<T> {
                 if !self.commit_to_current_term() {
                     // Reject read only request when this leader has not committed any log entry
                     // in its term.
+                    info!(
+                        self.logger,
+                        "leader has not yet committed in its term; dropping read index msg",
+                    );
                     return Ok(());
                 }
 
@@ -2331,6 +2335,11 @@ impl<T: Storage> Raft<T> {
                 from = m.from;
                 "state" => ?self.state,
             ),
+            MessageType::MsgReadIndex => info!(
+                self.logger,
+                "no leader at term {term}; dropping read index msg",
+                term = self.term;
+            ),
             _ => {}
         }
         Ok(())
@@ -2411,7 +2420,7 @@ impl<T: Storage> Raft<T> {
                 if self.leader_id == INVALID_ID {
                     info!(
                         self.logger,
-                        "no leader at term {term}; dropping index reading msg",
+                        "no leader at term {term}; dropping read index msg",
                         term = self.term;
                     );
                     return Ok(());
